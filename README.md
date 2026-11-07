@@ -2,7 +2,7 @@
 
 A Web Map Service and Web Feature Service demo app made with [Umka](https://github.com/vtereshkov/umka-lang) and [Tophat](https://tophat2d.dev).
 
-You can [download](https://github.com/vtereshkov/wms-wfs-viewer/releases) the release.
+You can [download](https://github.com/vtereshkov/wms-wfs-viewer/releases) the release and launch `run.bat` or `run.sh`.
 
 Alternatively, to run the demo directly from the repository folder, install [UmBox](https://umbox.tophat2d.dev/) and run
 ```
