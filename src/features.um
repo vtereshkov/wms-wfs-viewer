@@ -1,0 +1,319 @@
+// WFS feature layers: loading the features around the view, drawing and picking them
+
+import (
+	"std.um"
+	"th.um"
+	"canvas.um"
+	"rect.um"
+	"rt.um"
+
+	"geo.um"
+	"gml.um"
+	"net.um"
+	"ows.um"
+	"view.um"
+)
+
+const (
+	maxFeatures = 2000          // Per request
+	maxSpan* = 3000.0           // Meters. Features are only loaded for smaller views
+	reloadDelay = 0.5           // Seconds the view must stay still before loading
+	margin = 0.5                // Features are loaded for the view grown by this fraction on each side
+	targetMargin = 256          // Pixels rendered beyond each side of the view, so that small pans need no re-rendering
+	pickRadius = 6              // Pixels
+	lineWidth = 2.0
+	pointSize = 6.0
+)
+
+fn layerColor(index: int): uint32 {
+	palette := [12]uint32{
+		0xE6194BFF, 0x3CB44BFF, 0x4363D8FF, 0xF58231FF, 0x911EB4FF, 0x42D4F4FF,
+		0xF032E6FF, 0x9A6324FF, 0x469990FF, 0x800000FF, 0x000075FF, 0x808000FF}
+	return palette[index % len(palette)]
+}
+
+type (
+	Layer* = struct {
+		name, title: str
+		color: uint32
+		visible: bool
+		features: []gml::Feature
+		box: geo::Box           // Area the features were requested for
+		loading: bool
+		request: int            // Number of the latest request. Responses to earlier requests are ignored
+		truncated: bool         // The server had more features than requested
+		error: str
+	}
+
+	Selection* = struct {
+		layer: int              // -1 if nothing is selected
+		feature: gml::Feature
+		vertex: int             // -1 if no vertex is selected
+	}
+
+	Layers* = struct {
+		net: ^net::Net
+		wfs: ows::Wfs
+		crs: geo::Crs
+		layers: []Layer
+
+		viewBox: geo::Box
+		viewChangedAt: real
+
+		target: rt::RenderTarget
+		targetSize: th::Vf2
+		targetBox: geo::Box     // World area rendered to the target
+		targetRes: real
+		dirty: bool             // The target needs re-rendering
+	}
+
+	FeatureJob = struct {
+		layers: ^Layers
+		index: int
+		request: int
+		box: geo::Box
+	}
+)
+
+fn noSelection*(): Selection {
+	return {layer: -1, vertex: -1}
+}
+
+fn mk*(n: ^net::Net, wfs: ows::Wfs, crs: geo::Crs): ^Layers {
+	layers := &Layers{net: n, wfs: wfs, crs: crs, viewBox: geo::emptyBox()}
+	for i, ft in wfs.featureTypes {
+		layers.layers = append(layers.layers, Layer{name: ft.name, title: ft.title, color: layerColor(i), box: geo::emptyBox()})
+	}
+	return layers
+}
+
+fn (this: ^Layers) setVisible*(index: int, visible: bool) {
+	this.layers[index].visible = visible
+	this.dirty = true
+}
+
+fn (this: ^FeatureJob) run(w: ^net::Worker) {
+	layer := &this.layers.layers[this.index]
+	w.task = "Features " + layer.name
+
+	const fail = fn (layer: ^Layer, msg: str, w: ^net::Worker) {
+		layer.error = msg
+		layer.loading = false
+		w.net.report(sprintf("%s: %s", layer.name, msg))
+	}
+
+	// The response is useless if the job has been cancelled or the layer has been requested again
+	doc, err := ows::fetchXml(w, this.layers.wfs.featureUrl(layer.name, this.layers.crs, this.box, maxFeatures))
+	if w.cancelled() || this.request != layer.request {
+		return
+	}
+	if err.code != 0 {
+		fail(layer, err.msg, w)
+		return
+	}
+
+	features, err := gml::parse(&doc, this.layers.crs.latFirst() && this.layers.wfs.version >= "1.1")
+	if w.cancelled() || this.request != layer.request {
+		return
+	}
+	if err.code != 0 {
+		fail(layer, err.msg, w)
+		return
+	}
+
+	layer.features = features
+	layer.truncated = len(features) >= maxFeatures
+	layer.loading = false
+	layer.error = ""
+	this.layers.dirty = true
+}
+
+fn (this: ^Layers) isViewSmallEnough*(view: ^view::View): bool {
+	box := view.box()
+	return box.width() * this.crs.metersPerUnit() <= maxSpan && box.height() * this.crs.metersPerUnit() <= maxSpan
+}
+
+// Requests the features of the visible layers when the view has settled outside the area they were loaded for,
+// or well inside it if not all the features could be loaded for that area
+fn (this: ^Layers) update*(view: ^view::View) {
+	box := view.box()
+	if box != this.viewBox {
+		this.viewBox = box
+		this.viewChangedAt = std::clock()
+		return
+	}
+
+	if !this.isViewSmallEnough(view) || std::clock() - this.viewChangedAt < reloadDelay {
+		return
+	}
+
+	wanted := box.scaled(1 + 2 * margin)
+	for i, layer^ in this.layers {
+		if !layer.visible || layer.loading {
+			continue
+		}
+		if layer.box.containsBox(box) && !(layer.truncated && wanted.width() < layer.box.width() / 2) {
+			continue
+		}
+
+		layer.loading = true
+		layer.request++
+		layer.box = wanted
+		this.net.post(FeatureJob{this, i, layer.request, wanted})
+	}
+}
+
+fn drawFeature(view: ^view::View, f: ^gml::Feature, color: uint32, width: th::fu) {
+	// Features smaller than a pixel or two are drawn as dots
+	if f.box.width() / view.res < 2 && f.box.height() / view.res < 2 {
+		c := view.toScreen(f.box.center())
+		canvas::drawRect(color, rect::mk(c.x - width / 2, c.y - width / 2, width, width))
+		return
+	}
+
+	for _, part^ in f.parts {
+		if part.kind == .point {
+			for _, p in part.points {
+				c := view.toScreen(p)
+				canvas::drawRect(th::black, rect::mk(c.x - pointSize / 2 - 1, c.y - pointSize / 2 - 1, pointSize + 2, pointSize + 2))
+				canvas::drawRect(color, rect::mk(c.x - pointSize / 2, c.y - pointSize / 2, pointSize, pointSize))
+			}
+			continue
+		}
+
+		prev := view.toScreen(part.points[0])
+		for i := 1; i < len(part.points); i++ {
+			cur := view.toScreen(part.points[i])
+			canvas::drawLine(color, prev, cur, width)
+			prev = cur
+		}
+	}
+}
+
+// Renders the visible layers to the target that covers the view plus a margin
+fn (this: ^Layers) render(view: ^view::View) {
+	area := view::View{center: view.center, res: view.res, rect: {0, 0, this.targetSize.x, this.targetSize.y}}
+	this.targetBox = area.box()
+	this.targetRes = view.res
+	this.dirty = false
+
+	std::exitif(this.target.begin(true))
+	for _, layer^ in this.layers {
+		if !layer.visible {
+			continue
+		}
+		for _, f^ in layer.features {
+			if f.box.intersects(this.targetBox) {
+				drawFeature(&area, f, layer.color, lineWidth)
+			}
+		}
+	}
+	std::exitif(this.target.end())
+}
+
+fn (this: ^Layers) draw*(view: ^view::View) {
+	// The target is only recreated when the view outgrows it, since each one holds a GPU image until collected
+	if needed := th::Vf2{view.rect.w + 2 * targetMargin, view.rect.h + 2 * targetMargin}; needed.x > this.targetSize.x || needed.y > this.targetSize.y {
+		size := needed.divf(targetMargin).ceil().mulf(targetMargin)
+		var err: std::Err
+		this.target, err = rt::mk(size, .linear)
+		std::exitif(err)
+		this.targetSize = size
+		this.dirty = true
+		gc()
+	}
+
+	if this.dirty || view.res != this.targetRes || !this.targetBox.containsBox(view.box()) {
+		this.render(view)
+	}
+
+	img := this.target.toImage()
+	img.draw(th::mkTransform(view.toScreen({this.targetBox.min.x, this.targetBox.max.y}).round()))
+}
+
+// Draws the feature highlighted and, if `markVertices` is set, its vertices, including the selected one and the one under the mouse
+fn (this: ^Layers) drawSelection*(view: ^view::View, sel: Selection, color: uint32, markVertices: bool, hoverVertex: int = -1) {
+	if sel.layer < 0 {
+		return
+	}
+
+	drawFeature(view, &sel.feature, th::black, lineWidth + 4)
+	drawFeature(view, &sel.feature, color, lineWidth + 2)
+
+	if !markVertices {
+		return
+	}
+
+	for i, p in sel.feature.vertices() {
+		c := view.toScreen(p)
+		if c.x < view.rect.x || c.y < view.rect.y || c.x > view.rect.x + view.rect.w || c.y > view.rect.y + view.rect.h {
+			continue
+		}
+
+		size, fill := 6.0, th::white
+		if i == sel.vertex {
+			size, fill = 12.0, th::red
+		} else if i == hoverVertex {
+			size, fill = 10.0, color
+		}
+
+		canvas::drawRect(th::black, rect::mk(c.x - size / 2 - 1, c.y - size / 2 - 1, size + 2, size + 2))
+		canvas::drawRect(fill, rect::mk(c.x - size / 2, c.y - size / 2, size, size))
+	}
+}
+
+// Returns the index of the vertex of the selected line or polygon nearest to the screen point `s`, or -1 if there is no vertex nearby
+fn (this: ^Selection) pickVertex*(view: ^view::View, s: th::Vf2): int {
+	if this.layer < 0 || this.feature.numPoints() < 2 {
+		return -1
+	}
+
+	p := view.toWorld(s)
+	nearest, nearestDist := -1, pickRadius * view.res
+	for i, v in this.feature.vertices() {
+		if d := p.dist(v); d < nearestDist {
+			nearest, nearestDist = i, d
+		}
+	}
+	return nearest
+}
+
+// Picks the feature nearest to the screen point `s`, or, if there is none nearby, the smallest polygon around `s`
+fn (this: ^Layers) pick*(view: ^view::View, s: th::Vf2): Selection {
+	p := view.toWorld(s)
+	tolerance := pickRadius * view.res
+
+	nearest, nearestDist := noSelection(), tolerance
+	smallest, smallestArea := noSelection(), geo::huge
+
+	for i := len(this.layers) - 1; i >= 0; i-- {
+		layer := &this.layers[i]
+		if !layer.visible {
+			continue
+		}
+
+		for _, f^ in layer.features {
+			if !f.box.grown(tolerance).contains(p) {
+				continue
+			}
+
+			if d := f.dist(p); d < nearestDist {
+				nearest, nearestDist = Selection{i, f^, -1}, d
+			} else if area := f.box.width() * f.box.height(); area < smallestArea && f.covers(p) {
+				smallest, smallestArea = Selection{i, f^, -1}, area
+			}
+		}
+	}
+
+	return nearest.layer >= 0 ? nearest : smallest
+}
+
+fn (this: ^Layers) numVisible*(): int {
+	n := 0
+	for _, layer in this.layers {
+		if layer.visible {
+			n++
+		}
+	}
+	return n
+}

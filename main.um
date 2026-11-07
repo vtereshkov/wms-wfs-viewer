@@ -1,0 +1,36 @@
+// WMS/WFS viewer: a stress test for Umka and Tophat.
+// The user interface runs on its own fiber, the HTTP requests on a pool of worker fibers.
+// The main fiber that runs the frame callback schedules them.
+
+import (
+	"std.um"
+	"window.um"
+
+	"src/app.um"
+)
+
+const (
+	defaultUrl = "https://geodienste.ch/db/avc_0/deu?SERVICE=WFS&REQUEST=GetCapabilities"
+	jobBudget = 0.008           // Seconds per frame given to the worker fibers
+)
+
+fn init*() {
+	window::setup("WMS/WFS Viewer", 1280, 800)
+
+	viewer := app::mk(defaultUrl)
+	if std::argc() > 0 {
+		viewer.connect(std::argv(0))
+	}
+
+	ui := make(fiber, |viewer| {
+		for true {
+			viewer.frame()
+			resume()
+		}
+	})
+
+	window::onFrame.register(|viewer, ui| {
+		resume(ui)
+		viewer.net.run(jobBudget)
+	})
+}

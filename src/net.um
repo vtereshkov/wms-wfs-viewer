@@ -1,0 +1,180 @@
+// Background jobs running on a pool of worker fibers. A job typically sends an HTTP request,
+// yields while waiting for the response and then processes it, yielding from time to time.
+//
+// Fibers always yield to the fiber that created them, so the pool must be created on the
+// same fiber that calls `Net.run` - the main fiber that runs the frame callback.
+
+import (
+	"std.um"
+	"../umbox/http/http.um"
+	"../umbox/strings/strings.um"
+)
+
+type (
+	Job* = interface {
+		run(w: ^Worker)
+	}
+
+	Worker* = struct {
+		net: ^Net
+		fib: fiber
+		busy: bool          // Doing some computations, rather than waiting for a response or a job
+		task: str           // Description of the current job
+		epoch: int          // Epoch in which the current job started
+	}
+
+	Net* = struct {
+		queue: []Job
+		workers: []^Worker
+		epoch: int          // Incremented to cancel all the jobs
+		numRequests, numFailures, numBytes: int
+		messages: []str
+	}
+)
+
+const (
+	timeout = 60        // Seconds
+	maxMessages = 100
+)
+
+fn (this: ^Worker) loop() {
+	for true {
+		if len(this.net.queue) == 0 {
+			this.busy = false
+			this.task = ""
+			resume()
+			continue
+		}
+
+		job := this.net.queue[0]
+		this.net.queue = delete(this.net.queue, 0)
+
+		this.busy = true
+		this.epoch = this.net.epoch
+		job.run(this)
+	}
+}
+
+fn mk*(numWorkers: int): ^Net {
+	net := new(Net)
+	for i := 0; i < numWorkers; i++ {
+		w := new(Worker)
+		w.net = net
+		w.fib = make(fiber, |w| {w.loop()})
+		net.workers = append(net.workers, w)
+	}
+	return net
+}
+
+fn (this: ^Net) post*(job: Job, urgent: bool = false) {
+	if urgent {
+		this.queue = insert(this.queue, 0, job)
+	} else {
+		this.queue = append(this.queue, job)
+	}
+}
+
+// Drops the queued jobs and makes the running ones stop at their next request or check
+fn (this: ^Net) cancelAll*() {
+	this.queue = {}
+	this.epoch++
+}
+
+// True if the current job has been cancelled
+fn (this: ^Worker) cancelled*(): bool {
+	return this.epoch != this.net.epoch
+}
+
+// Resumes the workers until all of them are waiting or idle, or until the time budget (in seconds) is exhausted
+fn (this: ^Net) run*(budget: real) {
+	deadline := std::clock() + budget
+	for true {
+		busy := false
+		for _, w in this.workers {
+			resume(w.fib)
+			busy = busy || w.busy
+		}
+
+		if !busy || std::clock() > deadline {
+			break
+		}
+	}
+}
+
+fn (this: ^Net) numActive*(): int {
+	n := 0
+	for _, w in this.workers {
+		if w.task != "" {
+			n++
+		}
+	}
+	return n
+}
+
+fn (this: ^Net) numBusy*(): int {
+	n := 0
+	for _, w in this.workers {
+		if w.busy {
+			n++
+		}
+	}
+	return n
+}
+
+// Sends a GET request and yields until the response arrives. To be called from a job
+fn (this: ^Worker) fetch*(url: str): (http::Response, std::Err) {
+	this.net.numRequests++
+	started := std::time()
+
+	request := http::requestAsync({url: url})
+	for true {
+		resp, err := request.poll()
+
+		if resp.complete {
+			this.net.numBytes += len(resp.body)
+			if resp.status != 200 {
+				this.net.numFailures++
+				return resp, std::error(resp.status, sprintf("HTTP status %d", resp.status))
+			}
+			return resp, {}
+		}
+
+		if this.cancelled() {
+			return resp, std::error(1, "Cancelled")
+		}
+
+		// While the request is in progress, the error code is -1
+		if err.code > 0 || std::time() - started > timeout {
+			this.net.numFailures++
+			return resp, err.code > 0 ? err : std::error(1, "Request timed out")
+		}
+
+		this.busy = false
+		resume()
+		this.busy = true
+	}
+	return {}, {}
+}
+
+fn (this: ^Net) report*(msg: str) {
+	printf("%s\n", msg)
+	std::fflush(std::stdout())
+	this.messages = append(this.messages, msg)
+	if len(this.messages) > maxMessages {
+		this.messages = delete(this.messages, 0)
+	}
+}
+
+fn (this: ^Net) lastMessage*(): str {
+	return len(this.messages) > 0 ? this.messages[len(this.messages) - 1] : ""
+}
+
+// Returns the value of a response header, ignoring the case of its name
+fn header*(resp: http::Response, name: str): str {
+	for key, value in resp.headers {
+		if strings::tolower(key) == name {
+			return std::trim(value)
+		}
+	}
+	return ""
+}

@@ -1,0 +1,699 @@
+// The viewer: connection to a server, the map, the panels and the status bar
+
+import (
+	"std.um"
+	"th.um"
+	"canvas.um"
+	"coll.um"
+	"font.um"
+	"input.um"
+	"rect.um"
+	"ui.um"
+	"utf8.um"
+	"window.um"
+
+	"features.um"
+	"geo.um"
+	"net.um"
+	"ows.um"
+	"tiles.um"
+	"view.um"
+)
+
+const (
+	numWorkers = 6
+	panelWidth = 320
+	infoWidth = 360
+	statusHeight = 26
+	rowHeight = 26
+	padding = 4
+	fontSize = 16
+	clickDistance = 4           // Pixels the mouse may move between pressing and releasing for a click
+	zoomStep = 1.25
+	cacheDir = "cache"
+	urlFile = "last_url.txt"
+
+	mapColor = 0xF2EFE9FF
+	panelColor = 0xE4E4E4FF
+	statusColor = 0x303030FF
+	textColor = 0x202020FF
+	disabledColor = 0x808080FF
+	hiddenColor = 0xBBBBBBFF
+	hoverColor = 0xFFFFFFFF
+	selectionColor = 0xFFD700FF
+)
+
+type (
+	App* = struct {
+		net: ^net::Net
+		url: str
+		session: int                    // Incremented on each connection, so that outdated capabilities are ignored
+		connected: bool                 // Connected or connecting
+		connecting: bool                // Waiting for the capabilities
+		crs: geo::Crs
+		extent: geo::Box
+		view: view::View
+		tiles: ^tiles::Tiles            // null if the server has no WMS
+		layers: ^features::Layers       // null if the server has no WFS
+		showBaseMap: bool
+		selection, hover: features::Selection
+		hoverVertex: int                // Vertex of the selected feature under the mouse, or -1
+
+		ft: ui::Font
+		style: ui::Style
+		panel, info: ui::Gui
+		panelLayout, infoLayout: ui::LayoutFn
+		guiDims: th::Vf2
+		urlBox: ui::TextBox
+		layerScroll, infoScroll: real32
+
+		dragging: bool
+		dragDist: real
+		fps: real
+	}
+
+	CapsJob = struct {
+		app: ^App
+		session: int
+	}
+)
+
+// Formatting
+
+// Formats a number with thousands separators, e.g. 2'683'123.45
+fn grouped(x: real, decimals: int): str {
+	s := sprintf(sprintf("%%.%df", decimals), fabs(x))
+	dot := len(s)
+	for i, c in s {
+		if c == '.' {
+			dot = i
+			break
+		}
+	}
+
+	res := slice(s, dot)
+	for i := dot; i > 0; i -= 3 {
+		start := i > 3 ? i - 3 : 0
+		res = slice(s, start, i) + (i < dot ? "'" : "") + res
+	}
+	return (x < 0 ? "-" : "") + res
+}
+
+fn (this: ^App) formatCoords(p: geo::Point): str {
+	if this.crs.isGeographic() {
+		return sprintf("%.6f° E  %.6f° N", p.x, p.y)
+	}
+	return sprintf("E %s  N %s", grouped(p.x, 2), grouped(p.y, 2))
+}
+
+fn (this: ^App) formatWgs84(p: geo::Point): str {
+	ll := this.crs.toWgs84(p)
+	return sprintf("%.6f° N  %.6f° E", ll.y, ll.x)
+}
+
+// Shortens the text with an ellipsis to fit into `width` pixels
+fn (this: ^App) fit(text: str, width: th::fu): str {
+	if this.ft.measure(text).x <= width {
+		return text
+	}
+
+	runes := utf8::decode(text)
+	for n := len(runes) - 1; n > 0; n-- {
+		if s := utf8::encode(slice(runes, 0, n)) + "…"; this.ft.measure(s).x <= width {
+			return s
+		}
+	}
+	return "…"
+}
+
+// Connection
+
+fn supportsCrs(wfs: ^ows::Wfs, epsg: int): bool {
+	for _, ft in wfs.featureTypes {
+		if len(ft.crs) == 0 || validkey(ft.crs, epsg) {
+			return true
+		}
+	}
+	return false
+}
+
+// Prepares the map for the services found. Returns false if they cannot be used
+fn (this: ^App) setup(wms: ^ows::Wms, wfs: ^ows::Wfs): bool {
+	// The extent comes first, since the preferred CRS depends on where the data are
+	extent := geo::emptyBox()
+	if wms != null {
+		extent = wms.extent
+	} else {
+		for _, ft in wfs.featureTypes {
+			if !ft.extent.isEmpty() {
+				extent.add(ft.extent.min)
+				extent.add(ft.extent.max)
+			}
+		}
+	}
+	if extent.isEmpty() {
+		extent = {{-180, -85}, {180, 85}}
+	}
+
+	this.crs = {}
+	for _, crs in geo::candidateCrs(extent.center()) {
+		if (wms == null || validkey(wms.crs, crs.epsg)) && (wfs == null || supportsCrs(wfs, crs.epsg)) {
+			this.crs = crs
+			break
+		}
+	}
+
+	if this.crs.epsg == 0 {
+		this.net.report("The services have no common coordinate reference system the viewer supports")
+		return false
+	}
+
+	this.extent = this.crs.boxFromWgs84(extent)
+	this.view.minRes = 0.01 / this.crs.metersPerUnit()
+	this.view.maxRes = (this.extent.width() > this.extent.height() ? this.extent.width() : this.extent.height()) / 100
+	this.view.fit(this.extent)
+
+	if wms != null {
+		this.tiles = tiles::mk(this.net, wms^, this.crs, this.extent, cacheDir)
+		this.net.report(sprintf("Base map: %s (%s)", wms.title, this.crs.name()))
+	}
+
+	if wfs != null {
+		this.layers = features::mk(this.net, wfs^, this.crs)
+		this.net.report(sprintf("%d feature types", len(wfs.featureTypes)))
+	}
+	return true
+}
+
+fn loadWms(w: ^net::Worker, url: str): (^ows::Wms, std::Err) {
+	doc, err := ows::fetchXml(w, ows::capabilitiesUrl(url, "WMS"))
+	if err.code != 0 {
+		return null, err
+	}
+
+	wms, err := ows::parseWms(&doc)
+	if err.code != 0 {
+		return null, err
+	}
+	return new(ows::Wms, wms), {}
+}
+
+fn loadWfs(w: ^net::Worker, url: str): (^ows::Wfs, std::Err) {
+	doc, err := ows::fetchXml(w, ows::capabilitiesUrl(url, "WFS"))
+	if err.code != 0 {
+		return null, err
+	}
+
+	wfs, err := ows::parseWfs(&doc)
+	if err.code != 0 {
+		return null, err
+	}
+	return new(ows::Wfs, wfs), {}
+}
+
+fn (this: ^CapsJob) run(w: ^net::Worker) {
+	w.task = "Capabilities"
+	app := this.app
+
+	wms, wmsErr := loadWms(w, app.url)
+	wfs, wfsErr := loadWfs(w, app.url)
+	if w.cancelled() || this.session != app.session {
+		return
+	}
+
+	app.connecting = false
+	if wmsErr.code != 0 {
+		app.net.report("No WMS: " + wmsErr.msg)
+	}
+	if wfsErr.code != 0 {
+		app.net.report("No WFS: " + wfsErr.msg)
+	}
+	if wms == null && wfs == null {
+		app.net.report("No services found at " + app.url)
+		app.connected = false
+		return
+	}
+	app.connected = app.setup(wms, wfs)
+}
+
+fn loadUrl(): str {
+	f, err := std::fopen(urlFile, "rb")
+	if err.code != 0 {
+		return ""
+	}
+	data, err := std::freadall(f)
+	std::fclose(f)
+	return std::trim(data)
+}
+
+fn saveUrl(url: str): std::Err {
+	f, err := std::fopen(urlFile, "wb")
+	if err.code != 0 {
+		return err
+	}
+	fprintf(f, "%s\n", url)
+	return std::fclose(f)
+}
+
+fn (this: ^App) disconnect*() {
+	this.session++
+	this.connected = false
+	this.connecting = false
+	this.crs = {}
+	this.tiles = null
+	this.layers = null
+	this.selection = features::noSelection()
+	this.hover = features::noSelection()
+	this.hoverVertex = -1
+	this.net.cancelAll()
+}
+
+fn (this: ^App) connect*(url: str) {
+	this.disconnect()
+	this.url = url
+	this.urlBox.setBuf(url)
+	this.connected = true
+	this.connecting = true
+
+	if err := saveUrl(url); err.code != 0 {
+		this.net.report("Cannot save the URL: " + err.msg)
+	}
+
+	this.net.report("Connecting to " + url)
+	this.net.post(CapsJob{this, this.session}, true)
+}
+
+// Panels
+
+// A button that stays pressed while `down` is set. Like `ui::Gui.button`, it acts as a container
+fn latchButton(gui: ^ui::Gui, down: bool): bool {
+	if !gui.isEval && down {
+		style := gui.getStyle()^
+		style.posBox, style.negBox = style.negBox, style.posBox
+		gui.pushStyle(style)
+	}
+
+	pressed := gui.button()
+
+	if !gui.isEval && down {
+		gui.popStyle()
+	}
+	return pressed
+}
+
+// A button with a caption that looks dimmed and ignores clicks when disabled
+fn captionButton(gui: ^ui::Gui, caption: str, enabled: bool = true, down: bool = false): bool {
+	if !enabled {
+		gui.dupStyle()
+		gui.getStyle().ftColor = disabledColor
+	}
+
+	pressed := latchButton(gui, down)
+	gui.label(caption, {centerX: true, centerY: true})
+	gui.popContainer()
+
+	if !enabled {
+		gui.popStyle()
+	}
+	return pressed && enabled
+}
+
+// A row of cells of equal width. The `ui::BoxGrow.subdiv` boxes do not leave room for the padding
+fn cellRow(gui: ^ui::Gui, widths: []th::fu) {
+	gui.box({growType: .pxSpan, span: widths, dir: .right, padding: padding})
+}
+
+fn (this: ^App) hasInfo(): bool {
+	return this.selection.layer >= 0 && this.layers != null
+}
+
+fn (this: ^App) infoRect(): rect::Rect {
+	return rect::mk(window::wp.x - infoWidth, 0, infoWidth, window::wp.y - statusHeight)
+}
+
+fn (this: ^App) layerText(layer: ^features::Layer): str {
+	if layer.loading {
+		return layer.title + " …"
+	}
+	if layer.error != "" {
+		return layer.title + " (error)"
+	}
+	if layer.visible && !layer.box.isEmpty() {
+		return sprintf("%s (%d%s)", layer.title, len(layer.features), layer.truncated ? "+" : "")
+	}
+	return layer.title
+}
+
+fn (this: ^App) toggleLayer*(index: int) {
+	visible := !this.layers.layers[index].visible
+	this.layers.setVisible(index, visible)
+
+	// A feature of a hidden layer cannot stay selected
+	if !visible && this.selection.layer == index {
+		this.selection = features::noSelection()
+	}
+}
+
+fn (this: ^App) layoutLayerList(gui: ^ui::Gui, height: th::fu) {
+	const step = rowHeight + 2
+	layers := this.layers.layers
+
+	gui.scrollArea(&this.layerScroll, len(layers) * step, {rect: {0, 0, 0, height}, scrollBarSize: 8, speed: 2})
+	area := gui.getContainer().getDims()
+	if !gui.isEval {
+		canvas::beginScissorRect(area)
+	}
+
+	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: step - rowHeight})
+	for i, layer^ in layers {
+		// Hidden rows only reserve space, so that they cannot be clicked through the other widgets
+		if top := i * step - this.layerScroll; top + step < 0 || top > area.h {
+			gui.pushRect({})
+			continue
+		}
+
+		if latchButton(gui, layer.visible) {
+			this.toggleLayer(i)
+		}
+
+		r := gui.getContainer().getDims()
+		if !gui.isEval {
+			canvas::drawRect(layer.visible ? layer.color : hiddenColor, rect::mk(r.x + 6, r.y + r.h / 2 - 6, 12, 12))
+		}
+		gui.label(this.fit(this.layerText(layer), r.w - 32), {rect: {24, 0, 0, 0}, centerY: true})
+		gui.popContainer()
+	}
+	gui.popContainer()
+
+	if !gui.isEval {
+		canvas::endScissor()
+	}
+	gui.popContainer()
+}
+
+fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
+	height := window::wp.y - statusHeight
+	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
+		rect: {padding, padding, panelWidth - 2 * padding, height - 2 * padding}})
+
+	width := panelWidth - 2 * padding
+	gui.label(this.fit("Server URL (WMS/WFS endpoint or capabilities)", width), {centerY: true})
+
+	// The URL can only be edited while disconnected
+	if this.connected {
+		gui.dupStyle()
+		style := gui.getStyle()
+		style.containerBox = style.negBox
+		style.ftColor = disabledColor
+		gui.stack()
+		gui.label(this.fit(this.url, width - 8), {rect: {4, 0, 0, 0}, centerY: true})
+		gui.popContainer()
+		gui.popStyle()
+	} else {
+		gui.textBox(&this.urlBox)
+	}
+
+	half := (width - padding) / 2
+	cellRow(gui, {half, half})
+	if captionButton(gui, this.connected ? "Disconnect" : "Connect") {
+		if this.connected {
+			this.disconnect()
+			this.net.report("Disconnected")
+		} else {
+			this.connect(std::trim(this.urlBox.getBuf()))
+		}
+	}
+	if captionButton(gui, "Fit to extent", this.crs.epsg != 0) {
+		this.view.fit(this.extent)
+	}
+	gui.popContainer()
+
+	if this.tiles != null {
+		if captionButton(gui, this.fit("Base map: " + this.tiles.wms.title, width - 16), true, this.showBaseMap) {
+			this.showBaseMap = !this.showBaseMap
+		}
+	}
+
+	if this.layers != null {
+		gui.label(sprintf("Feature layers (%d)", len(this.layers.layers)), {centerY: true})
+		this.layoutLayerList(gui, height - padding - gui.getDims().y)
+	}
+
+	gui.popContainer()
+}
+
+fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
+	sel := &this.selection
+	f := &sel.feature
+	vertices := f.vertices()
+	layer := &this.layers.layers[sel.layer]
+	height := window::wp.y - statusHeight
+	width := infoWidth - 2 * padding
+
+	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
+		rect: {padding, padding, width, height - 2 * padding}})
+
+	const closeWidth = 80
+	cellRow(gui, {width - closeWidth - padding, closeWidth})
+	gui.label(this.fit(layer.title, width - closeWidth - padding), {centerY: true})
+	if captionButton(gui, "Close") {
+		sel^ = features::noSelection()
+	}
+	gui.popContainer()
+
+	gui.label(this.fit(sprintf("%s  ·  %s  ·  %d vertices", f.id, f.kindName(), len(vertices)), width), {centerY: true})
+
+	// The watched point: the vertex selected on the map, or the point itself, or the center
+	watched, watchedName := f.box.center(), "Center"
+	if sel.vertex >= 0 {
+		watched, watchedName = vertices[sel.vertex], sprintf("Vertex %d of %d", sel.vertex + 1, len(vertices))
+	} else if len(vertices) == 1 {
+		watched, watchedName = vertices[0], "Point"
+	}
+
+	gui.label(sprintf("%s: %s", watchedName, this.formatCoords(watched)), {centerY: true})
+	gui.label(sprintf("WGS 84: %s", this.formatWgs84(watched)), {centerY: true})
+
+	if len(vertices) > 1 {
+		gui.dupStyle()
+		gui.getStyle().ftColor = disabledColor
+		gui.label(sel.vertex >= 0 ? "Click another vertex on the map to watch it" : "Click a vertex on the map to watch it", {centerY: true})
+		gui.popStyle()
+	}
+
+	// Attributes, under their header
+	const step = rowHeight + 2
+	numRows := len(f.attrs) + 1
+
+	gui.scrollArea(&this.infoScroll, numRows * step, {rect: {0, 0, 0, height - padding - gui.getDims().y}, scrollBarSize: 8, speed: 2})
+	area := gui.getContainer().getDims()
+	if !gui.isEval {
+		canvas::beginScissorRect(area)
+	}
+
+	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: step - rowHeight})
+	for row := 0; row < numRows; row++ {
+		if top := row * step - this.infoScroll; top + step < 0 || top > area.h {
+			gui.pushRect({})
+			continue
+		}
+
+		if row == 0 {
+			gui.label("Attributes", {centerY: true})
+		} else {
+			attr := f.attrs[row - 1]
+			gui.label(this.fit(sprintf("%s: %s", attr.name, attr.value), width - 12), {centerY: true})
+		}
+	}
+	gui.popContainer()
+
+	if !gui.isEval {
+		canvas::endScissor()
+	}
+	gui.popContainer()
+
+	gui.popContainer()
+}
+
+// The GUIs are recreated when the window is resized, as their root rectangles are fixed
+fn (this: ^App) resizeGuis(dims: th::Vf2) {
+	panelSelection, infoSelection := this.panel.selection, this.info.selection
+
+	this.panel = ui::mk(rect::mk(0, 0, panelWidth, dims.y - statusHeight), this.style)
+	this.info = ui::mk(this.infoRect(), this.style)
+
+	this.panel.selection, this.info.selection = panelSelection, infoSelection
+	this.guiDims = dims
+}
+
+// Map
+
+fn (this: ^App) handleMapInput() {
+	// Nothing to navigate before the first successful connection
+	if this.crs.epsg == 0 {
+		return
+	}
+
+	mouse := input::getMousePos()
+	overMap := coll::vf2ToRect(mouse, this.view.rect) && !(this.hasInfo() && coll::vf2ToRect(mouse, this.infoRect()))
+
+	if overMap && input::isJustPressed(.mouse1) {
+		this.dragging = true
+		this.dragDist = 0
+	}
+
+	if this.dragging {
+		delta := input::getMouseDelta()
+		this.view.pan(delta)
+		this.dragDist += delta.mag()
+
+		if !input::isPressed(.mouse1) {
+			this.dragging = false
+			// A click near a vertex of the selected line or polygon selects the vertex, any other click picks a feature
+			if this.dragDist < clickDistance && this.layers != null {
+				if vertex := this.selection.pickVertex(&this.view, mouse); vertex >= 0 {
+					this.selection.vertex = vertex
+				} else {
+					this.selection = this.layers.pick(&this.view, mouse)
+					this.infoScroll = 0
+				}
+			}
+		}
+	}
+
+	if scroll := input::getMouseScroll().y; overMap && scroll != 0 {
+		this.view.zoomAt(mouse, exp(-scroll * log(zoomStep)))
+	}
+
+	this.hover = features::noSelection()
+	this.hoverVertex = -1
+	if overMap && !this.dragging && this.layers != null {
+		this.hoverVertex = this.selection.pickVertex(&this.view, mouse)
+		if this.hoverVertex < 0 {
+			this.hover = this.layers.pick(&this.view, mouse)
+		}
+	}
+
+	cursor := window::Cursor.system
+	if this.dragging {
+		cursor = .sizeAll
+	} else if this.hover.layer >= 0 || this.hoverVertex >= 0 {
+		cursor = .finger
+	}
+	window::setCursor(cursor)
+}
+
+fn (this: ^App) drawHint(text: str) {
+	size := this.ft.measure(text)
+	r := rect::mk(this.view.rect.x + (this.view.rect.w - size.x) / 2 - 8, this.view.rect.y + 12, size.x + 16, size.y + 8)
+	canvas::drawRect(0x000000A0, r)
+	this.ft.draw(text, {r.x + 8, r.y + 4}, th::white)
+}
+
+fn (this: ^App) drawMap() {
+	canvas::beginScissorRect(this.view.rect)
+	canvas::drawRect(mapColor, this.view.rect)
+
+	if this.tiles != null && this.showBaseMap {
+		this.tiles.draw(&this.view)
+	}
+
+	if this.layers != null {
+		this.layers.draw(&this.view)
+		this.layers.drawSelection(&this.view, this.hover, hoverColor, false)
+		this.layers.drawSelection(&this.view, this.selection, selectionColor, true, this.hoverVertex)
+	}
+
+	if this.connecting {
+		this.drawHint("Connecting…")
+	} else if this.layers != null && this.layers.numVisible() > 0 && !this.layers.isViewSmallEnough(&this.view) {
+		this.drawHint(sprintf("Zoom in to a view smaller than %s m to load features", grouped(features::maxSpan, 0)))
+	}
+
+	canvas::endScissor()
+}
+
+// The status bar shows the cursor position and the scale on the left, the statistics on the right,
+// and the latest message in between
+fn (this: ^App) drawStatus() {
+	r := rect::mk(0, window::wp.y - statusHeight, window::wp.x, statusHeight)
+	canvas::drawRect(statusColor, r)
+
+	left := ""
+	if this.crs.epsg != 0 {
+		left = "1:" + grouped(this.view.res * this.crs.metersPerUnit() / 0.00028, 0)
+		if mouse := input::getMousePos(); coll::vf2ToRect(mouse, this.view.rect) {
+			p := this.view.toWorld(mouse)
+			left = sprintf("%s   %s   %s", this.formatCoords(p), this.formatWgs84(p), left)
+		}
+	}
+
+	right := ""
+	if this.tiles != null {
+		right = sprintf("Tiles: %d (%d loading)   ", this.tiles.numCached(), this.tiles.numRequests)
+	}
+	this.fps = 0.95 * this.fps + 0.05 * 1000.0 / th::delta
+	right += sprintf("Workers: %d active, %d busy, %d queued   Requests: %d (%d failed), %.1f MB   Heap: %.0f MB   %d FPS",
+		this.net.numActive(), this.net.numBusy(), len(this.net.queue),
+		this.net.numRequests, this.net.numFailures, this.net.numBytes / 1e6, memusage() / 1e6, round(this.fps))
+
+	y := r.y + (statusHeight - fontSize) / 2
+	leftWidth, rightWidth := this.ft.measure(left).x, this.ft.measure(right).x
+	const gap = 24
+
+	this.ft.draw(left, {r.x + 8, y}, th::white)
+	this.ft.draw(right, {r.x + r.w - rightWidth - 8, y}, th::white)
+	if space := r.w - leftWidth - rightWidth - 16 - 2 * gap; space > 50 {
+		this.ft.draw(this.fit(this.net.lastMessage(), space), {r.x + 8 + leftWidth + gap, y}, 0xFFD27FFF)
+	}
+}
+
+// Must be called on the fiber that runs the frame callback, since it creates the worker fibers.
+// The viewer starts disconnected, with the last URL connected to, or `defaultUrl`
+fn mk*(defaultUrl: str): ^App {
+	app := &App{net: net::mk(numWorkers), showBaseMap: true, selection: features::noSelection(), hover: features::noSelection(), hoverVertex: -1}
+
+	app.style = ui::getDefaultStyle()
+	if ft, err := font::load("data/Roboto.ttf", fontSize); err.code == 0 {
+		app.style.ft = ft
+	} else {
+		app.net.report("Cannot load font: " + err.msg)
+	}
+	app.style.ftColor = textColor
+	app.style.containerBox.color = panelColor
+	app.ft = app.style.ft
+
+	app.panelLayout = |app| {app.layoutPanel(gui)}
+	app.infoLayout = |app| {app.layoutInfo(gui)}
+
+	url := loadUrl()
+	app.urlBox.setBuf(url != "" ? url : defaultUrl)
+	return app
+}
+
+fn (this: ^App) frame*() {
+	window::setViewport(window::getDims())
+	dims := window::wp
+	this.view.rect = rect::mk(panelWidth, 0, dims.x - panelWidth, dims.y - statusHeight)
+	if dims != this.guiDims {
+		this.resizeGuis(dims)
+	}
+
+	// The panels handle the input first and clear the mouse buttons pressed over them
+	this.panel.eval(this.panelLayout)
+	if this.hasInfo() {
+		this.info.eval(this.infoLayout)
+	}
+
+	this.handleMapInput()
+	if this.layers != null {
+		this.layers.update(&this.view)
+	}
+
+	this.drawMap()
+	this.panel.draw(this.panelLayout)
+	if this.hasInfo() {
+		this.info.draw(this.infoLayout)
+	}
+	this.drawStatus()
+}

@@ -1,0 +1,315 @@
+// A small non-validating XML parser, good enough for OGC service responses.
+// Declarations, comments, processing instructions and DOCTYPEs are skipped.
+// Only leaf elements keep their text, so mixed content is not supported.
+
+import "std.um"
+
+type Node* = struct {
+	prefix, name: str       // Namespace prefix and local name, e.g. "gml" and "posList"
+	attrs: map[str]str      // Qualified attribute names; may be null
+	text: str               // Trimmed text of a leaf element
+	children: []Node
+}
+
+// Number of tags parsed between yields to the parent fiber
+const yieldPeriod = 500
+
+fn isSpace(c: char): bool {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t'
+}
+
+fn isNameEnd(c: char): bool {
+	return isSpace(c) || c == '>' || c == '/' || c == '='
+}
+
+fn parseHex(s: str): int {
+	x := 0
+	for _, c in s {
+		if c >= '0' && c <= '9' {
+			x = 16 * x + int(c) - int('0')
+		} else if c >= 'a' && c <= 'f' {
+			x = 16 * x + int(c) - int('a') + 10
+		} else if c >= 'A' && c <= 'F' {
+			x = 16 * x + int(c) - int('A') + 10
+		}
+	}
+	return x
+}
+
+fn encodeUtf8(code: int): str {
+	if code < 0x80 {
+		return str(char(code))
+	}
+	if code < 0x800 {
+		return str(char(0xC0 | code >> 6)) + str(char(0x80 | code & 0x3F))
+	}
+	if code < 0x10000 {
+		return str(char(0xE0 | code >> 12)) + str(char(0x80 | code >> 6 & 0x3F)) + str(char(0x80 | code & 0x3F))
+	}
+	return str(char(0xF0 | code >> 18)) + str(char(0x80 | code >> 12 & 0x3F)) + str(char(0x80 | code >> 6 & 0x3F)) + str(char(0x80 | code & 0x3F))
+}
+
+fn decodeEntity(entity: str): str {
+	if entity == "amp"  {return "&"}
+	if entity == "lt"   {return "<"}
+	if entity == "gt"   {return ">"}
+	if entity == "quot" {return "\""}
+	if entity == "apos" {return "'"}
+	if len(entity) > 1 && entity[0] == '#' {
+		return encodeUtf8(entity[1] == 'x' ? parseHex(slice(entity, 2)) : std::atoi(slice(entity, 1)))
+	}
+	return "&" + entity + ";"
+}
+
+fn unescape(s: str): str {
+	amp := -1
+	for i, c in s {
+		if c == '&' {
+			amp = i
+			break
+		}
+	}
+	if amp < 0 {
+		return s
+	}
+
+	res := slice(s, 0, amp)
+	for i := amp; i < len(s); i++ {
+		if s[i] != '&' {
+			res += str(s[i])
+			continue
+		}
+
+		semi := i + 1
+		for semi < len(s) && s[semi] != ';' {
+			semi++
+		}
+		if semi >= len(s) {
+			res += slice(s, i)
+			break
+		}
+
+		res += decodeEntity(slice(s, i + 1, semi))
+		i = semi
+	}
+	return res
+}
+
+fn splitName(qname: str): (str, str) {
+	for i := len(qname) - 1; i >= 0; i-- {
+		if qname[i] == ':' {
+			return slice(qname, 0, i), slice(qname, i + 1)
+		}
+	}
+	return "", qname
+}
+
+fn skipPast(s: str, i: int, terminator: str): int {
+	for i < len(s) {
+		if s[i] == terminator[0] && slice(s, i, i + len(terminator)) == terminator {
+			return i + len(terminator)
+		}
+		i++
+	}
+	return i
+}
+
+// Parses `s` into a tree whose root is a "#document" node. Yields to the parent fiber from time to time,
+// so that a long document can be parsed on a background fiber
+fn parse*(s: str): (Node, std::Err) {
+	type Open = struct {
+		qname: str
+		contentStart: int
+	}
+
+	nodes := []Node{{name: "#document"}}
+	open := []Open{{}}
+	numTags := 0
+
+	i := 0
+	for i < len(s) {
+		if s[i] != '<' {
+			i++
+			continue
+		}
+
+		numTags++
+		if numTags % yieldPeriod == 0 {
+			resume()
+		}
+
+		next := i + 1 < len(s) ? s[i + 1] : char(0)
+
+		if next == '?' {
+			i = skipPast(s, i, "?>")
+		} else if next == '!' {
+			if slice(s, i, i + 4) == "<!--" {
+				i = skipPast(s, i, "-->")
+			} else if slice(s, i, i + 9) == "<![CDATA[" {
+				i = skipPast(s, i, "]]>")
+			} else {
+				i = skipPast(s, i, ">")
+			}
+		} else if next == '/' {
+			// End tag
+			start := i + 2
+			i = start
+			for i < len(s) && s[i] != '>' {
+				i++
+			}
+			qname := std::trim(slice(s, start, i))
+			i++
+
+			top := len(nodes) - 1
+			if top == 0 || open[top].qname != qname {
+				return {}, std::error(1, sprintf("Unexpected end tag </%s>", qname))
+			}
+
+			node := nodes[top]
+			if len(node.children) == 0 {
+				node.text = unescape(std::trim(slice(s, open[top].contentStart, start - 2)))
+			}
+
+			nodes = delete(nodes, top)
+			open = delete(open, top)
+			nodes[top - 1].children = append(nodes[top - 1].children, node)
+		} else {
+			// Start tag
+			start := i + 1
+			i = start
+			for i < len(s) && !isNameEnd(s[i]) {
+				i++
+			}
+
+			node := Node{}
+			qname := slice(s, start, i)
+			node.prefix, node.name = splitName(qname)
+
+			// Attributes
+			selfClosing := false
+			for i < len(s) {
+				for i < len(s) && isSpace(s[i]) {
+					i++
+				}
+				if i >= len(s) {
+					break
+				}
+				if s[i] == '>' {
+					i++
+					break
+				}
+				if s[i] == '/' {
+					selfClosing = true
+					i = skipPast(s, i, ">")
+					break
+				}
+
+				nameStart := i
+				for i < len(s) && !isNameEnd(s[i]) {
+					i++
+				}
+				attrName := slice(s, nameStart, i)
+
+				for i < len(s) && s[i] != '"' && s[i] != '\'' && s[i] != '>' {
+					i++
+				}
+				if i >= len(s) || s[i] == '>' {
+					continue
+				}
+
+				quote := s[i]
+				valueStart := i + 1
+				i = valueStart
+				for i < len(s) && s[i] != quote {
+					i++
+				}
+
+				if !valid(node.attrs) {
+					node.attrs = {}
+				}
+				node.attrs[attrName] = unescape(slice(s, valueStart, i))
+				i++
+			}
+
+			if selfClosing {
+				top := len(nodes) - 1
+				nodes[top].children = append(nodes[top].children, node)
+			} else {
+				nodes = append(nodes, node)
+				open = append(open, Open{qname, i})
+			}
+		}
+	}
+
+	if len(nodes) > 1 {
+		return {}, std::error(1, sprintf("Unterminated element <%s>", open[len(open) - 1].qname))
+	}
+
+	return nodes[0], {}
+}
+
+// Returns the attribute value, or an empty string if there is no such attribute
+fn (this: ^Node) attr*(name: str): str {
+	if !valid(this.attrs) || !validkey(this.attrs, name) {
+		return ""
+	}
+	return this.attrs[name]
+}
+
+// Returns the first child element with the given local name, or null
+fn (this: ^Node) child*(name: str): ^Node {
+	for _, c^ in this.children {
+		if c.name == name {
+			return c
+		}
+	}
+	return null
+}
+
+// Returns the text of the first child element with the given local name, or an empty string
+fn (this: ^Node) childText*(name: str): str {
+	if c := this.child(name); c != null {
+		return c.text
+	}
+	return ""
+}
+
+// Returns all child elements with the given local name
+fn (this: ^Node) childrenNamed*(name: str): []^Node {
+	res := []^Node{}
+	for _, c^ in this.children {
+		if c.name == name {
+			res = append(res, c)
+		}
+	}
+	return res
+}
+
+// Returns the first element with the given local name in depth-first order, including this one, or null
+fn (this: ^Node) find*(name: str): ^Node {
+	if this.name == name {
+		return this
+	}
+	for _, c^ in this.children {
+		if found := c.find(name); found != null {
+			return found
+		}
+	}
+	return null
+}
+
+// Follows a path of local names, e.g. "Capability/Request/GetMap", and returns the element found or null
+fn (this: ^Node) path*(path: str): ^Node {
+	node := this
+	start := 0
+	for i := 0; i <= len(path); i++ {
+		if i == len(path) || path[i] == '/' {
+			node = node.child(slice(path, start, i))
+			if node == null {
+				return null
+			}
+			start = i + 1
+		}
+	}
+	return node
+}

@@ -1,0 +1,238 @@
+// Features from the GML returned by WFS GetFeature requests
+
+import (
+	"std.um"
+
+	"geo.um"
+	"xml.um"
+)
+
+type Kind* = enum {
+	point
+	line
+	ring
+}
+
+type Part* = struct {
+	kind: Kind
+	points: []geo::Point
+}
+
+type Attr* = struct {
+	name, value: str
+}
+
+type Feature* = struct {
+	id: str
+	parts: []Part
+	box: geo::Box
+	attrs: []Attr
+}
+
+// Number of features read between yields to the parent fiber
+const yieldPeriod = 100
+
+fn isGeometry(name: str): bool {
+	for _, g in []str{"Point", "LineString", "LinearRing", "Polygon", "Curve", "Surface", "CompositeCurve", "CompositeSurface",
+		"MultiPoint", "MultiLineString", "MultiCurve", "MultiPolygon", "MultiSurface", "MultiGeometry"} {
+		if name == g {
+			return true
+		}
+	}
+	return false
+}
+
+fn isSeparator(c: char): bool {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == ','
+}
+
+// Parses "x1 y1 x2 y2 ..." or "x1,y1 x2,y2 ..."
+fn parseCoords(text: str, dim: int, latFirst: bool): []geo::Point {
+	values := []real{}
+	i := 0
+	for i < len(text) {
+		for i < len(text) && isSeparator(text[i]) {
+			i++
+		}
+		start := i
+		for i < len(text) && !isSeparator(text[i]) {
+			i++
+		}
+		if i > start {
+			values = append(values, std::atof(slice(text, start, i)))
+		}
+	}
+
+	points := make([]geo::Point, len(values) / dim)
+	for k, p^ in points {
+		a, b := values[k * dim], values[k * dim + 1]
+		p^ = latFirst ? geo::Point{b, a} : geo::Point{a, b}
+	}
+	return points
+}
+
+fn (this: ^Feature) readCoords(node: ^xml::Node, kind: Kind, dim: int, latFirst: bool) {
+	part := Part{kind: kind}
+	for _, c^ in node.children {
+		if c.name == "posList" || c.name == "pos" || c.name == "coordinates" {
+			if d := std::atoi(c.attr("srsDimension")); d > 0 {
+				dim = d
+			}
+			part.points = append(part.points, parseCoords(c.text, dim, latFirst))
+		}
+	}
+
+	if len(part.points) > 0 {
+		this.parts = append(this.parts, part)
+		for _, p in part.points {
+			this.box.add(p)
+		}
+	}
+}
+
+fn (this: ^Feature) readGeometry(node: ^xml::Node, dim: int, latFirst: bool) {
+	if d := std::atoi(node.attr("srsDimension")); d > 0 {
+		dim = d
+	}
+
+	if node.name == "Point" {
+		this.readCoords(node, .point, dim, latFirst)
+	} else if node.name == "LineString" || node.name == "LineStringSegment" || node.name == "Arc" {
+		this.readCoords(node, .line, dim, latFirst)
+	} else if node.name == "LinearRing" {
+		this.readCoords(node, .ring, dim, latFirst)
+	} else {
+		// Polygons, curves, surfaces and collections
+		for _, c^ in node.children {
+			this.readGeometry(c, dim, latFirst)
+		}
+	}
+}
+
+fn readFeature(node: ^xml::Node, latFirst: bool): Feature {
+	f := Feature{id: node.attr("gml:id"), box: geo::emptyBox()}
+	if f.id == "" {
+		f.id = node.attr("fid")
+	}
+
+	for _, prop^ in node.children {
+		if prop.name == "boundedBy" {
+			continue
+		}
+
+		if len(prop.children) > 0 && isGeometry(prop.children[0].name) {
+			f.readGeometry(&prop.children[0], 2, latFirst)
+		} else if len(prop.children) == 0 {
+			f.attrs = append(f.attrs, Attr{prop.name, prop.text})
+		}
+	}
+
+	return f
+}
+
+// Reads all features from a GML feature collection. Yields to the parent fiber from time to time,
+// so that a large collection can be read on a background fiber
+fn parse*(doc: ^xml::Node, latFirst: bool): ([]Feature, std::Err) {
+	root := doc.child("FeatureCollection")
+	if root == null {
+		return {}, std::error(1, "Not a feature collection")
+	}
+
+	features := []Feature{}
+	for _, member^ in root.children {
+		if member.name == "member" || member.name == "featureMember" || member.name == "featureMembers" {
+			for _, node^ in member.children {
+				if f := readFeature(node, latFirst); len(f.parts) > 0 {
+					features = append(features, f)
+				}
+
+				if len(features) % yieldPeriod == 0 {
+					resume()
+				}
+			}
+		}
+	}
+
+	return features, {}
+}
+
+fn (this: ^Feature) numPoints*(): int {
+	n := 0
+	for _, part in this.parts {
+		n += len(part.points)
+	}
+	return n
+}
+
+// All the points of all the parts
+fn (this: ^Feature) vertices*(): []geo::Point {
+	res := []geo::Point{}
+	for _, part in this.parts {
+		res = append(res, part.points)
+	}
+	return res
+}
+
+fn (this: ^Feature) kindName*(): str {
+	if len(this.parts) == 0 {
+		return "Empty"
+	}
+
+	kind := this.parts[0].kind
+	for _, part in this.parts {
+		if part.kind != kind {
+			return "Collection"
+		}
+	}
+
+	if kind == .point {
+		return len(this.parts) == 1 ? "Point" : "Multipoint"
+	}
+	if kind == .line {
+		return len(this.parts) == 1 ? "Line" : "Multiline"
+	}
+	return "Polygon"
+}
+
+// Distance from `p` to the nearest point, segment or ring edge of the feature
+fn (this: ^Feature) dist*(p: geo::Point): real {
+	best := geo::huge
+	for _, part in this.parts {
+		pts := part.points
+		if part.kind == .point || len(pts) == 1 {
+			for _, pt in pts {
+				if d := p.dist(pt); d < best {
+					best = d
+				}
+			}
+			continue
+		}
+
+		for i := 1; i < len(pts); i++ {
+			if d := p.distToSegment(pts[i - 1], pts[i]); d < best {
+				best = d
+			}
+		}
+	}
+	return best
+}
+
+// True if `p` is inside the rings of the feature. Holes are handled by the even-odd rule
+fn (this: ^Feature) covers*(p: geo::Point): bool {
+	inside := false
+	for _, part in this.parts {
+		if part.kind != .ring {
+			continue
+		}
+
+		pts := part.points
+		for i, j := 0, len(pts) - 1; i < len(pts); i++ {
+			a, b := pts[i], pts[j]
+			if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+				inside = !inside
+			}
+			j = i
+		}
+	}
+	return inside
+}

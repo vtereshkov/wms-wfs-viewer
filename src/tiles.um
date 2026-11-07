@@ -1,0 +1,288 @@
+// WMS base map requested in fixed-size tiles that are cached in memory and on disk
+
+import (
+	"std.um"
+	"th.um"
+	"image.um"
+
+	"geo.um"
+	"net.um"
+	"ows.um"
+	"view.um"
+	"xml.um"
+)
+
+const (
+	tileSize = 256
+	maxTiles = 400              // Tiles kept in memory
+	maxRequests = 8             // Tile requests queued or in progress
+	retryDelay = 15             // Seconds before a failed tile is requested again
+	fallbackLevels = 4          // Coarser levels drawn while the current level is loading
+)
+
+type (
+	Key = struct {
+		level, x, y: int
+	}
+
+	State = enum {
+		loading
+		ready
+		failed
+	}
+
+	Tile = struct {
+		state: State
+		img: image::Image
+		lastUsed: int           // Frame number
+		failedAt: int           // Seconds
+	}
+
+	Tiles* = struct {
+		net: ^net::Net
+		wms: ows::Wms
+		crs: geo::Crs
+		rootRes: real           // Resolution of level 0, at which the whole extent fits into a single tile
+		cachePrefix: str
+		tiles: map[Key]^Tile
+		frame: int
+		numRequests: int
+		numDownloaded, numFromDisk: int
+	}
+
+	TileJob = struct {
+		tiles: ^Tiles
+		key: Key
+	}
+)
+
+// FNV-1a
+fn hash(s: str): uint {
+	h := uint(2166136261)
+	for _, c in s {
+		h = (h ~ uint(c)) * 16777619 & 0xFFFFFFFF
+	}
+	return h
+}
+
+fn mk*(n: ^net::Net, wms: ows::Wms, crs: geo::Crs, extent: geo::Box, cacheDir: str): ^Tiles {
+	tiles := &Tiles{net: n, wms: wms, crs: crs, tiles: {}}
+
+	size := extent.width() > extent.height() ? extent.width() : extent.height()
+	tiles.rootRes = 1.0
+	for tiles.rootRes * tileSize < size {
+		tiles.rootRes *= 2
+	}
+	for tiles.rootRes * tileSize / 2 >= size {
+		tiles.rootRes /= 2
+	}
+
+	tiles.cachePrefix = sprintf("%s/%08x", cacheDir, hash(wms.getMapUrl + wms.layer + wms.format + crs.name()))
+
+	// Create the disk cache directory if needed. The command is the same on Windows and POSIX
+	probe := cacheDir + "/.probe"
+	if f, err := std::fopen(probe, "wb"); err.code == 0 {
+		std::fclose(f)
+		std::remove(probe)
+	} else {
+		std::system("mkdir " + cacheDir)
+	}
+
+	return tiles
+}
+
+fn (this: ^Tiles) levelRes(level: int): real {
+	res := this.rootRes
+	for i := 0; i < level; i++ {
+		res /= 2
+	}
+	return res
+}
+
+// The coarsest level whose tiles are at least as detailed as the screen
+fn (this: ^Tiles) levelFor(res: real): int {
+	level := 0
+	for this.levelRes(level) > res && level < 30 {
+		level++
+	}
+	return level
+}
+
+fn (this: ^Tiles) keyBox(key: Key): geo::Box {
+	span := tileSize * this.levelRes(key.level)
+	return {{key.x * span, key.y * span}, {(key.x + 1) * span, (key.y + 1) * span}}
+}
+
+fn (this: ^Tiles) path(key: Key): str {
+	return sprintf("%s_%d_%d_%d.%s", this.cachePrefix, key.level, key.x, key.y, this.wms.format == "image/jpeg" ? "jpg" : "png")
+}
+
+fn (this: ^Tiles) finish(tile: ^Tile, state: State) {
+	tile.state = state
+	if state == .failed {
+		tile.failedAt = std::time()
+	}
+	this.numRequests--
+}
+
+fn (this: ^TileJob) run(w: ^net::Worker) {
+	tiles := this.tiles
+	tile := tiles.tiles[this.key]
+	w.task = sprintf("Tile %d/%d/%d", this.key.level, this.key.x, this.key.y)
+
+	// The tile has left the view while waiting in the queue
+	if tile.lastUsed < tiles.frame - 1 {
+		tiles.tiles = delete(tiles.tiles, this.key)
+		tiles.numRequests--
+		return
+	}
+
+	path := tiles.path(this.key)
+	if img, err := image::load(path); err.code == 0 {
+		tile.img = img
+		tiles.numFromDisk++
+		tiles.finish(tile, .ready)
+		return
+	}
+
+	resp, err := w.fetch(tiles.wms.mapUrl(tiles.crs, tiles.keyBox(this.key), tileSize, tileSize))
+	if err.code != 0 {
+		if !w.cancelled() {
+			w.net.report(sprintf("Tile request failed: %s", err.msg))
+		}
+		tiles.finish(tile, .failed)
+		return
+	}
+
+	if contentType := net::header(resp, "content-type"); len(contentType) < 6 || slice(contentType, 0, 6) != "image/" {
+		msg := "Not an image"
+		if doc, parseErr := xml::parse(resp.body); parseErr.code == 0 {
+			msg = ows::exceptionText(&doc)
+		}
+		w.net.report(sprintf("WMS error: %s", msg))
+		tiles.finish(tile, .failed)
+		return
+	}
+
+	file, err := std::fopen(path, "wb")
+	if err.code != 0 {
+		w.net.report(sprintf("Cannot write %s", path))
+		tiles.finish(tile, .failed)
+		return
+	}
+	std::fwrite(file, &resp.body)
+	std::fclose(file)
+
+	tile.img, err = image::load(path)
+	if err.code != 0 {
+		w.net.report(sprintf("Cannot decode %s: %s", path, err.msg))
+		tiles.finish(tile, .failed)
+		return
+	}
+
+	tiles.numDownloaded++
+	tiles.finish(tile, .ready)
+}
+
+fn (this: ^Tiles) drawTile(view: ^view::View, key: Key, tile: ^Tile) {
+	// Rounding the corners prevents gaps between adjacent tiles
+	box := this.keyBox(key)
+	topLeft := view.toScreen({box.min.x, box.max.y}).round()
+	bottomRight := view.toScreen({box.max.x, box.min.y}).round()
+
+	tile.img.draw(th::mkTransform(topLeft, bottomRight.sub(topLeft).divf(tileSize)))
+}
+
+// Draws the tiles of `level` visible in `view`, and requests the missing ones if `request` is set
+fn (this: ^Tiles) drawLevel(view: ^view::View, level: int, request: bool) {
+	type Missing = struct {
+		key: Key
+		dist: real
+	}
+
+	viewBox := view.box()
+	center := viewBox.center()
+	span := tileSize * this.levelRes(level)
+	missing := []Missing{}
+
+	for y := floor(viewBox.min.y / span); y <= floor(viewBox.max.y / span); y++ {
+		for x := floor(viewBox.min.x / span); x <= floor(viewBox.max.x / span); x++ {
+			key := Key{level, x, y}
+
+			if !validkey(this.tiles, key) {
+				if request {
+					missing = append(missing, Missing{key, center.dist(this.keyBox(key).center())})
+				}
+				continue
+			}
+
+			tile := this.tiles[key]
+			tile.lastUsed = this.frame
+
+			switch tile.state {
+				case .ready:
+					this.drawTile(view, key, tile)
+				case .failed:
+					if request && std::time() - tile.failedAt > retryDelay {
+						this.tiles = delete(this.tiles, key)
+					}
+			}
+		}
+	}
+
+	// Request the tiles nearest to the view center first
+	sort(missing, true, dist)
+	for _, m in missing {
+		if this.numRequests >= maxRequests {
+			break
+		}
+		this.tiles[m.key] = &Tile{state: .loading, lastUsed: this.frame}
+		this.numRequests++
+		this.net.post(TileJob{this, m.key})
+	}
+}
+
+// Drops the least recently used tiles when there are too many of them
+fn (this: ^Tiles) evict() {
+	if len(this.tiles) <= maxTiles {
+		return
+	}
+
+	type Entry = struct {
+		key: Key
+		lastUsed: int
+	}
+
+	entries := []Entry{}
+	for key, tile in this.tiles {
+		if tile.state != .loading {
+			entries = append(entries, Entry{key, tile.lastUsed})
+		}
+	}
+	sort(entries, true, lastUsed)
+
+	for i := 0; i < len(entries) && len(this.tiles) > maxTiles * 3 / 4; i++ {
+		this.tiles = delete(this.tiles, entries[i].key)
+	}
+
+	// The tile images hold GPU textures that are only released when collected
+	gc()
+}
+
+fn (this: ^Tiles) draw*(view: ^view::View) {
+	this.frame++
+	level := this.levelFor(view.res)
+
+	for l := level - fallbackLevels; l < level; l++ {
+		if l >= 0 {
+			this.drawLevel(view, l, false)
+		}
+	}
+	this.drawLevel(view, level, true)
+
+	this.evict()
+}
+
+fn (this: ^Tiles) numCached*(): int {
+	return len(this.tiles)
+}

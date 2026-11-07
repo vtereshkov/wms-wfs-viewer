@@ -1,0 +1,56 @@
+// The visible part of the map and the transformation between world and screen coordinates
+
+import (
+	"th.um"
+	"rect.um"
+
+	"geo.um"
+)
+
+type View* = struct {
+	center: geo::Point          // World coordinates of the center of `rect`
+	res: real                   // World units per pixel
+	minRes, maxRes: real
+	rect: rect::Rect            // Map area on the screen
+}
+
+fn (this: ^View) toScreen*(p: geo::Point): th::Vf2 {
+	return {
+		this.rect.x + this.rect.w / 2 + (p.x - this.center.x) / this.res,
+		this.rect.y + this.rect.h / 2 - (p.y - this.center.y) / this.res}
+}
+
+fn (this: ^View) toWorld*(s: th::Vf2): geo::Point {
+	return {
+		this.center.x + (s.x - this.rect.x - this.rect.w / 2) * this.res,
+		this.center.y - (s.y - this.rect.y - this.rect.h / 2) * this.res}
+}
+
+fn (this: ^View) box*(): geo::Box {
+	hw, hh := this.rect.w / 2 * this.res, this.rect.h / 2 * this.res
+	return {{this.center.x - hw, this.center.y - hh}, {this.center.x + hw, this.center.y + hh}}
+}
+
+fn (this: ^View) setRes*(res: real) {
+	if res < this.minRes {res = this.minRes}
+	if res > this.maxRes {res = this.maxRes}
+	this.res = res
+}
+
+// Zooms by `factor` keeping the world point under the screen point `s` in place
+fn (this: ^View) zoomAt*(s: th::Vf2, factor: real) {
+	anchor := this.toWorld(s)
+	this.setRes(this.res * factor)
+	moved := this.toWorld(s)
+	this.center = {this.center.x + anchor.x - moved.x, this.center.y + anchor.y - moved.y}
+}
+
+fn (this: ^View) pan*(delta: th::Vf2) {
+	this.center = {this.center.x - delta.x * this.res, this.center.y + delta.y * this.res}
+}
+
+fn (this: ^View) fit*(box: geo::Box) {
+	this.center = box.center()
+	resX, resY := box.width() / this.rect.w, box.height() / this.rect.h
+	this.setRes(resX > resY ? resX : resY)
+}

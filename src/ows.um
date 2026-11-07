@@ -1,0 +1,256 @@
+// OGC Web Map Service and Web Feature Service: capabilities and request URLs
+
+import (
+	"std.um"
+	"../umbox/strings/strings.um"
+
+	"geo.um"
+	"net.um"
+	"xml.um"
+)
+
+type Wms* = struct {
+	version: str
+	getMapUrl: str
+	format: str
+	layer, title: str           // The first named layer, used as the base map
+	crs: map[int]bool           // Supported EPSG codes
+	extent: geo::Box            // {lon, lat}
+}
+
+type FeatureType* = struct {
+	name, title: str
+	crs: map[int]bool
+	extent: geo::Box            // {lon, lat}
+}
+
+type Wfs* = struct {
+	version: str
+	getFeatureUrl: str
+	featureTypes: []FeatureType
+}
+
+// URLs
+
+fn encode*(s: str): str {
+	const hex = "0123456789ABCDEF"
+	res := ""
+	for _, c in s {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~' || c == ':' {
+			res += str(c)
+		} else {
+			res += "%" + str(hex[int(c) >> 4]) + str(hex[int(c) & 0xF])
+		}
+	}
+	return res
+}
+
+// Appends query parameters to a URL that may already have a query part
+fn withParams*(url, params: str): str {
+	if !strings::contains(url, "?") {
+		return url + "?" + params
+	}
+	if last := url[len(url) - 1]; last == '?' || last == '&' {
+		return url + params
+	}
+	return url + "&" + params
+}
+
+// Builds a GetCapabilities request from any service URL, dropping the OGC parameters it may already have
+fn capabilitiesUrl*(url, service: str): str {
+	parts := strings::split(url, "?")
+	query := []str{}
+	if len(parts) > 1 {
+		for _, param in strings::split(parts[1], "&") {
+			key := strings::toupper(strings::split(param, "=")[0])
+			if param != "" && key != "SERVICE" && key != "REQUEST" && key != "VERSION" {
+				query = append(query, param)
+			}
+		}
+	}
+	query = append(query, []str{"SERVICE=" + service, "REQUEST=GetCapabilities"})
+	return parts[0] + "?" + strings::join(query, "&")
+}
+
+// Capabilities parsing
+
+fn readCrs(crs: map[int]bool, text: str) {
+	for _, s in strings::split(text, " ") {
+		if code := geo::epsgCode(s); code != 0 {
+			crs[code] = true
+		}
+	}
+}
+
+fn readCorner(text: str): geo::Point {
+	coords := strings::split(std::trim(text), " ")
+	if len(coords) < 2 {
+		return {}
+	}
+	return {std::atof(coords[0]), std::atof(coords[1])}
+}
+
+fn (this: ^Wms) readLayer(layer: ^xml::Node): bool {
+	for _, c^ in layer.children {
+		if c.name == "CRS" || c.name == "SRS" {
+			readCrs(this.crs, c.text)
+		} else if c.name == "EX_GeographicBoundingBox" {
+			this.extent = {
+				{std::atof(c.childText("westBoundLongitude")), std::atof(c.childText("southBoundLatitude"))},
+				{std::atof(c.childText("eastBoundLongitude")), std::atof(c.childText("northBoundLatitude"))}}
+		} else if c.name == "LatLonBoundingBox" {
+			this.extent = {
+				{std::atof(c.attr("minx")), std::atof(c.attr("miny"))},
+				{std::atof(c.attr("maxx")), std::atof(c.attr("maxy"))}}
+		}
+	}
+
+	if name := layer.childText("Name"); name != "" {
+		this.layer, this.title = name, layer.childText("Title")
+		return true
+	}
+
+	for _, child in layer.childrenNamed("Layer") {
+		if this.readLayer(child) {
+			return true
+		}
+	}
+	return false
+}
+
+fn parseWms*(doc: ^xml::Node): (Wms, std::Err) {
+	root := doc.child("WMS_Capabilities")
+	if root == null {
+		root = doc.child("WMT_MS_Capabilities")
+	}
+	if root == null {
+		return {}, std::error(1, "Not a WMS capabilities document")
+	}
+
+	wms := Wms{version: root.attr("version"), crs: {}, extent: geo::emptyBox()}
+
+	getMap := root.path("Capability/Request/GetMap")
+	if getMap == null {
+		return {}, std::error(1, "WMS has no GetMap operation")
+	}
+
+	if res := getMap.path("DCPType/HTTP/Get/OnlineResource"); res != null {
+		wms.getMapUrl = res.attr("xlink:href")
+	}
+
+	for _, format in getMap.childrenNamed("Format") {
+		if format.text == "image/png" || wms.format == "" && format.text == "image/jpeg" {
+			wms.format = format.text
+		}
+	}
+	if wms.format == "" {
+		return {}, std::error(1, "WMS supports neither PNG nor JPEG")
+	}
+
+	if layer := root.path("Capability/Layer"); layer == null || !wms.readLayer(layer) {
+		return {}, std::error(1, "WMS has no named layers")
+	}
+
+	return wms, {}
+}
+
+fn parseWfs*(doc: ^xml::Node): (Wfs, std::Err) {
+	root := doc.child("WFS_Capabilities")
+	if root == null {
+		return {}, std::error(1, "Not a WFS capabilities document")
+	}
+
+	wfs := Wfs{version: root.attr("version")}
+
+	if ops := root.child("OperationsMetadata"); ops != null {
+		for _, op in ops.childrenNamed("Operation") {
+			if get := op.path("DCP/HTTP/Get"); op.attr("name") == "GetFeature" && get != null {
+				wfs.getFeatureUrl = get.attr("xlink:href")
+			}
+		}
+	} else if get := root.path("Capability/Request/GetFeature/DCPType/HTTP/Get"); get != null {
+		wfs.getFeatureUrl = get.attr("onlineResource")
+	}
+
+	if wfs.getFeatureUrl == "" {
+		return {}, std::error(1, "WFS has no GetFeature operation")
+	}
+
+	if list := root.child("FeatureTypeList"); list != null {
+		for _, ft in list.childrenNamed("FeatureType") {
+			featureType := FeatureType{name: ft.childText("Name"), title: ft.childText("Title"), crs: {}, extent: geo::emptyBox()}
+			if featureType.title == "" {
+				featureType.title = featureType.name
+			}
+
+			for _, c^ in ft.children {
+				if c.name == "DefaultCRS" || c.name == "OtherCRS" || c.name == "DefaultSRS" || c.name == "OtherSRS" || c.name == "SRS" {
+					readCrs(featureType.crs, c.text)
+				} else if c.name == "WGS84BoundingBox" {
+					featureType.extent = {readCorner(c.childText("LowerCorner")), readCorner(c.childText("UpperCorner"))}
+				} else if c.name == "LatLongBoundingBox" {
+					featureType.extent = {
+						{std::atof(c.attr("minx")), std::atof(c.attr("miny"))},
+						{std::atof(c.attr("maxx")), std::atof(c.attr("maxy"))}}
+				}
+			}
+
+			wfs.featureTypes = append(wfs.featureTypes, featureType)
+		}
+	}
+
+	return wfs, {}
+}
+
+// Requests
+
+fn bboxParam(box: geo::Box, latFirst: bool): str {
+	if latFirst {
+		return sprintf("%f,%f,%f,%f", box.min.y, box.min.x, box.max.y, box.max.x)
+	}
+	return sprintf("%f,%f,%f,%f", box.min.x, box.min.y, box.max.x, box.max.y)
+}
+
+fn (this: ^Wms) mapUrl*(crs: geo::Crs, box: geo::Box, width, height: int): str {
+	v13 := this.version >= "1.3"
+	return withParams(this.getMapUrl, sprintf("SERVICE=WMS&VERSION=%s&REQUEST=GetMap&LAYERS=%s&STYLES=&%s=%s&BBOX=%s&WIDTH=%d&HEIGHT=%d&FORMAT=%s",
+		this.version, encode(this.layer), v13 ? "CRS" : "SRS", crs.name(), bboxParam(box, v13 && crs.latFirst()), width, height, encode(this.format)))
+}
+
+fn (this: ^Wfs) featureUrl*(typeName: str, crs: geo::Crs, box: geo::Box, count: int): str {
+	v2 := this.version >= "2"
+	v11 := this.version >= "1.1"
+	srs := v11 ? crs.urn() : crs.name()
+	return withParams(this.getFeatureUrl, sprintf("SERVICE=WFS&VERSION=%s&REQUEST=GetFeature&%s=%s&%s=%d&SRSNAME=%s&BBOX=%s,%s",
+		this.version, v2 ? "TYPENAMES" : "TYPENAME", encode(typeName), v2 ? "COUNT" : "MAXFEATURES", count, srs, bboxParam(box, v11 && crs.latFirst()), srs))
+}
+
+// Returns the message of an OGC exception report, or an empty string if `doc` is not an exception report
+fn exceptionText*(doc: ^xml::Node): str {
+	if e := doc.find("ExceptionText"); e != null {
+		return e.text
+	}
+	if e := doc.find("ServiceException"); e != null {
+		return e.text
+	}
+	return ""
+}
+
+// Fetches an XML document, treating OGC exception reports as errors. To be called from a job
+fn fetchXml*(w: ^net::Worker, url: str): (xml::Node, std::Err) {
+	resp, err := w.fetch(url)
+	if err.code != 0 {
+		return {}, err
+	}
+
+	doc, err := xml::parse(resp.body)
+	if err.code != 0 {
+		return {}, err
+	}
+
+	if msg := exceptionText(&doc); msg != "" {
+		return {}, std::error(1, msg)
+	}
+
+	return doc, {}
+}
