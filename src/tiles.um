@@ -140,6 +140,7 @@ fn (this: ^TileJob) run(w: ^net::Worker) {
 	path := tiles.path(this.key)
 	if img, err := image::load(path); err.code == 0 {
 		tile.img = img
+		tile.img.setfilter(.linear)
 		tiles.numFromDisk++
 		tiles.finish(tile, .ready)
 		return
@@ -180,6 +181,7 @@ fn (this: ^TileJob) run(w: ^net::Worker) {
 		return
 	}
 
+	tile.img.setfilter(.linear)
 	tiles.numDownloaded++
 	tiles.finish(tile, .ready)
 }
