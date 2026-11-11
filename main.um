@@ -23,8 +23,11 @@ fn init*() {
 	}
 
 	ui := make(fiber, |viewer| {
-		for true {
+		for frame := 0; true; frame++ {
 			viewer.frame()
+			if frame % 100 == 0 {
+				gc()
+			}
 			resume()
 		}
 	})

@@ -118,11 +118,10 @@ fn (this: ^App) fit(text: str, width: th::fu): str {
 	}
 
 	runes := utf8::decode(text)
-	for n := len(runes) - 1; n > 0; n-- {
-		if s := utf8::encode(slice(runes, 0, n)) + "…"; this.ft.measure(s).x <= width {
-			return s
-		}
+	if s := utf8::encode(slice(runes, 0, len(runes) / 2)) + "…"; this.ft.measure(s).x <= width {
+		return s
 	}
+	
 	return "…"
 }
 
@@ -318,9 +317,9 @@ fn captionButton(gui: ^ui::Gui, caption: str, enabled: bool = true, down: bool =
 	return pressed && enabled
 }
 
-// A row of cells of equal width. The `ui::BoxGrow.subdiv` boxes do not leave room for the padding
+// A row of cells of equal width
 fn cellRow(gui: ^ui::Gui, widths: []th::fu) {
-	gui.box({growType: .pxSpan, span: widths, dir: .right, padding: padding})
+	gui.box({subdivisions: len(widths), growType: .subdiv, span: widths, dir: .right})
 }
 
 fn (this: ^App) hasInfo(): bool {
@@ -453,12 +452,12 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
 		rect: {padding, padding, width, height - 2 * padding}})
 
-	const closeWidth = 80
-	cellRow(gui, {width - closeWidth - padding, closeWidth})
-	gui.label(this.fit(layer.title, width - closeWidth - padding), {centerY: true})
+	const closeWidth = 20
+	cellRow(gui, {closeWidth, width - closeWidth})
 	if captionButton(gui, "Close") {
 		sel^ = features::noSelection()
 	}
+	gui.label(this.fit(layer.title, width - closeWidth - padding), {centerX: true, centerY: true})	
 	gui.popContainer()
 
 	gui.label(this.fit(sprintf("%s  ·  %s  ·  %d vertices", f.id, f.kindName(), len(vertices)), width), {centerY: true})
@@ -499,10 +498,10 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 		}
 
 		if row == 0 {
-			gui.label("Attributes", {centerY: true})
+			gui.label("Attributes:", {centerY: true})
 		} else {
 			attr := f.attrs[row - 1]
-			gui.label(this.fit(sprintf("%s: %s", attr.name, attr.value), width - 12), {centerY: true})
+			gui.label(this.fit(sprintf("      %s: %s", attr.name, attr.value), width - 12), {centerY: true})
 		}
 	}
 	gui.popContainer()

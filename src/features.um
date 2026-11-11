@@ -20,6 +20,7 @@ const (
 	reloadDelay = 0.5           // Seconds the view must stay still before loading
 	margin = 0.5                // Features are loaded for the view grown by this fraction on each side
 	targetMargin = 256          // Pixels rendered beyond each side of the view, so that small pans need no re-rendering
+	rerenderDelay = 0.3         // Seconds the view must stay still before the features are re-rendered for it
 	pickRadius = 6              // Pixels
 	lineWidth = 2.0
 	pointSize = 6.0
@@ -171,6 +172,10 @@ fn drawFeature(view: ^view::View, f: ^gml::Feature, color: uint32, width: th::fu
 		return
 	}
 
+	// Segments entirely beyond one side of the view are skipped
+	x0, y0 := view.rect.x - width, view.rect.y - width
+	x1, y1 := view.rect.x + view.rect.w + width, view.rect.y + view.rect.h + width
+
 	for _, part^ in f.parts {
 		if part.kind == .point {
 			for _, p in part.points {
@@ -181,10 +186,17 @@ fn drawFeature(view: ^view::View, f: ^gml::Feature, color: uint32, width: th::fu
 			continue
 		}
 
+		// Steps shorter than a pixel are merged into the next segment, except at the end of the part
+		last := len(part.points) - 1
 		prev := view.toScreen(part.points[0])
-		for i := 1; i < len(part.points); i++ {
+		for i := 1; i <= last; i++ {
 			cur := view.toScreen(part.points[i])
-			canvas::drawLine(color, prev, cur, width)
+			if i < last && fabs(cur.x - prev.x) < 1 && fabs(cur.y - prev.y) < 1 {
+				continue
+			}
+			if !(cur.x < x0 && prev.x < x0 || cur.x > x1 && prev.x > x1 || cur.y < y0 && prev.y < y0 || cur.y > y1 && prev.y > y1) {
+				canvas::drawLine(color, prev, cur, width)
+			}
 			prev = cur
 		}
 	}
@@ -219,16 +231,20 @@ fn (this: ^Layers) draw*(view: ^view::View) {
 		this.target, err = rt::mk(size, .linear)
 		std::exitif(err)
 		this.targetSize = size
+		this.targetRes = 0          // The new target is blank, so it cannot wait for the view to settle
 		this.dirty = true
 		gc()
 	}
 
-	if this.dirty || view.res != this.targetRes || !this.targetBox.containsBox(view.box()) {
+	// Re-rendering is slow with large layers, so while the view is being zoomed or panned, the old rendering is scaled and shifted
+	stale := this.dirty || view.res != this.targetRes || !this.targetBox.containsBox(view.box())
+	if stale && (this.targetRes == 0 || std::clock() - this.viewChangedAt >= rerenderDelay) {
 		this.render(view)
 	}
 
+	scale := this.targetRes / view.res
 	img := this.target.toImage()
-	img.draw(th::mkTransform(view.toScreen({this.targetBox.min.x, this.targetBox.max.y}).round()))
+	img.draw(th::mkTransform(view.toScreen({this.targetBox.min.x, this.targetBox.max.y}).round(), {scale, scale}))
 }
 
 // Draws the feature highlighted and, if `markVertices` is set, its vertices, including the selected one and the one under the mouse
