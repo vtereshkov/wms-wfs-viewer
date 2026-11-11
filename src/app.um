@@ -319,7 +319,7 @@ fn captionButton(gui: ^ui::Gui, caption: str, enabled: bool = true, down: bool =
 
 // A row of cells of equal width
 fn cellRow(gui: ^ui::Gui, widths: []th::fu) {
-	gui.box({subdivisions: len(widths), growType: .subdiv, span: widths, dir: .right})
+	gui.box({subdivisions: len(widths), growType: .pxSpan, span: widths, dir: .right, padding: padding})
 }
 
 fn (this: ^App) hasInfo(): bool {
@@ -452,15 +452,15 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
 		rect: {padding, padding, width, height - 2 * padding}})
 
-	const closeWidth = 20
+	const closeWidth = rowHeight
 	cellRow(gui, {closeWidth, width - closeWidth})
-	if captionButton(gui, "Close") {
+	if captionButton(gui, "X") {
 		sel^ = features::noSelection()
 	}
 	gui.label(this.fit(layer.title, width - closeWidth - padding), {centerX: true, centerY: true})	
 	gui.popContainer()
 
-	gui.label(this.fit(sprintf("%s  ·  %s  ·  %d vertices", f.id, f.kindName(), len(vertices)), width), {centerY: true})
+	gui.label(this.fit(sprintf(" %s  ·  %s  ·  %d vertices", f.id, f.kindName(), len(vertices)), width), {centerY: true})
 
 	// The watched point: the vertex selected on the map, or the point itself, or the center
 	watched, watchedName := f.box.center(), "Center"
@@ -470,15 +470,8 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 		watched, watchedName = vertices[0], "Point"
 	}
 
-	gui.label(sprintf("%s: %s", watchedName, this.formatCoords(watched)), {centerY: true})
-	gui.label(sprintf("WGS 84: %s", this.formatWgs84(watched)), {centerY: true})
-
-	if len(vertices) > 1 {
-		gui.dupStyle()
-		gui.getStyle().ftColor = disabledColor
-		gui.label(sel.vertex >= 0 ? "Click another vertex on the map to watch it" : "Click a vertex on the map to watch it", {centerY: true})
-		gui.popStyle()
-	}
+	gui.label(sprintf(" %s: %s", watchedName, this.formatCoords(watched)), {centerY: true})
+	gui.label(sprintf(" WGS 84: %s", this.formatWgs84(watched)), {centerY: true})
 
 	// Attributes, under their header
 	const step = rowHeight + 2
@@ -498,10 +491,10 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 		}
 
 		if row == 0 {
-			gui.label("Attributes:", {centerY: true})
+			gui.label(" Attributes:", {centerY: true})
 		} else {
 			attr := f.attrs[row - 1]
-			gui.label(this.fit(sprintf("      %s: %s", attr.name, attr.value), width - 12), {centerY: true})
+			gui.label(this.fit(sprintf("       %s: %s", attr.name, attr.value), width - 12), {centerY: true})
 		}
 	}
 	gui.popContainer()
