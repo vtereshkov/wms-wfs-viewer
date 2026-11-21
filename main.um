@@ -10,17 +10,18 @@ import (
 )
 
 const (
-	defaultUrl = "https://geodienste.ch/db/avc_0/deu?SERVICE=WFS&REQUEST=GetCapabilities"
 	jobBudget = 0.008           // Seconds per frame given to the worker fibers
 )
 
 fn init*() {
 	window::setup("WMS/WFS Viewer", 1280, 800)
 
-	// Command line: [wmsUrl [wfsUrl]]. A single URL is used for both services
-	viewer := app::mk(defaultUrl)
+	// Command line: [wmsUrl [wfsUrl]], connected to as one more server. A single URL is used for both services
+	viewer := app::mk()
 	if std::argc() > 0 {
-		viewer.connect(std::argv(0), std::argc() > 1 ? std::argv(1) : std::argv(0))
+		wmsUrl := std::argv(0)
+		wfsUrl := std::argc() > 1 ? std::argv(1) : wmsUrl
+		viewer.connect(viewer.addServer({name: "Command line", wmsUrl: wmsUrl, wfsUrl: wfsUrl}))
 	}
 
 	ui := make(fiber, |viewer| {

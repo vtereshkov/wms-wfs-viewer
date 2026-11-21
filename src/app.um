@@ -12,14 +12,13 @@ import (
 	"utf8.um"
 	"window.um"
 
-	"../umbox/strings/strings.um"
-
 	"features.um"
 	"geo.um"
 	"net.um"
 	"ows.um"
 	"tiles.um"
 	"view.um"
+	"xml.um"
 )
 
 const (
@@ -33,7 +32,7 @@ const (
 	clickDistance = 4           // Pixels the mouse may move between pressing and releasing for a click
 	zoomStep = 1.25
 	cacheDir = "cache"
-	urlFile = "last_url.txt"        // The WMS URL and the WFS URL, one per line
+	serversFile = "servers.xml"
 
 	mapColor = 0xF2EFE9FF
 	panelColor = 0xE4E4E4FF
@@ -46,9 +45,16 @@ const (
 )
 
 type (
+	// A WMS for the base map and a WFS for the feature layers. Either URL may be empty
+	Server* = struct {
+		name: str
+		wmsUrl, wfsUrl: str
+	}
+
 	App* = struct {
 		net: ^net::Net
-		wmsUrl, wfsUrl: str             // Either may be empty, but not both
+		servers: []Server
+		server: int                     // Index of the server connected or connecting to
 		session: int                    // Incremented on each connection, so that outdated capabilities are ignored
 		connected: bool                 // Connected or connecting
 		connecting: bool                // Waiting for the capabilities
@@ -66,7 +72,6 @@ type (
 		panel, info: ui::Gui
 		panelLayout, infoLayout: ui::LayoutFn
 		guiDims: th::Vf2
-		wmsBox, wfsBox: ui::TextBox
 		layerScroll, infoScroll: real32
 
 		dragging: bool
@@ -77,6 +82,7 @@ type (
 	CapsJob = struct {
 		app: ^App
 		session: int
+		server: Server
 	}
 )
 
@@ -218,11 +224,11 @@ fn (this: ^CapsJob) run(w: ^net::Worker) {
 	var wms: ^ows::Wms
 	var wfs: ^ows::Wfs
 	var wmsErr, wfsErr: std::Err
-	if app.wmsUrl != "" {
-		wms, wmsErr = loadWms(w, app.wmsUrl)
+	if this.server.wmsUrl != "" {
+		wms, wmsErr = loadWms(w, this.server.wmsUrl)
 	}
-	if app.wfsUrl != "" {
-		wfs, wfsErr = loadWfs(w, app.wfsUrl)
+	if this.server.wfsUrl != "" {
+		wfs, wfsErr = loadWfs(w, this.server.wfsUrl)
 	}
 	if w.cancelled() || this.session != app.session {
 		return
@@ -243,34 +249,33 @@ fn (this: ^CapsJob) run(w: ^net::Worker) {
 	app.connected = app.setup(wms, wfs)
 }
 
-// Returns the WMS URL and the WFS URL last connected to. A single line, as written by earlier versions, is used for both
-fn loadUrls(): (str, str) {
-	f, err := std::fopen(urlFile, "rb")
+// Reads the servers to choose from, listed as <server name="..." wms="..." wfs="..."/> in a <servers> element
+fn loadServers(path: str): ([]Server, std::Err) {
+	f, err := std::fopen(path, "rb")
 	if err.code != 0 {
-		return "", ""
+		return {}, err
 	}
 	data, err := std::freadall(f)
 	std::fclose(f)
-
-	text := str(data)
-	if len(text) > 0 && text[len(text) - 1] == '\n' {
-		text = slice(text, 0, len(text) - 1)
-	}
-
-	lines := strings::split(text, "\n")
-	if len(lines) == 1 {
-		return std::trim(lines[0]), std::trim(lines[0])
-	}
-	return std::trim(lines[0]), std::trim(lines[1])
-}
-
-fn saveUrls(wmsUrl, wfsUrl: str): std::Err {
-	f, err := std::fopen(urlFile, "wb")
 	if err.code != 0 {
-		return err
+		return {}, err
 	}
-	fprintf(f, "%s\n%s\n", wmsUrl, wfsUrl)
-	return std::fclose(f)
+
+	doc, err := xml::parse(str(data))
+	if err.code != 0 {
+		return {}, err
+	}
+
+	root := doc.child("servers")
+	if root == null {
+		return {}, std::error(1, "No <servers> element")
+	}
+
+	servers := []Server{}
+	for _, s in root.childrenNamed("server") {
+		servers = append(servers, Server{name: s.attr("name"), wmsUrl: s.attr("wms"), wfsUrl: s.attr("wfs")})
+	}
+	return servers, {}
 }
 
 fn (this: ^App) disconnect*() {
@@ -286,31 +291,25 @@ fn (this: ^App) disconnect*() {
 	this.net.cancelAll()
 }
 
-// Connects to a WMS for the base map and a WFS for the feature layers. Either URL may be empty
-fn (this: ^App) connect*(wmsUrl, wfsUrl: str) {
-	this.disconnect()
-	this.wmsUrl, this.wfsUrl = wmsUrl, wfsUrl
-	this.wmsBox.setBuf(wmsUrl)
-	this.wfsBox.setBuf(wfsUrl)
+// Adds a server to choose from and returns its index
+fn (this: ^App) addServer*(server: Server): int {
+	this.servers = append(this.servers, server)
+	return len(this.servers) - 1
+}
 
-	if wmsUrl == "" && wfsUrl == "" {
-		this.net.report("Enter a WMS URL, a WFS URL or both")
+fn (this: ^App) connect*(index: int) {
+	this.disconnect()
+	server := this.servers[index]
+	if server.wmsUrl == "" && server.wfsUrl == "" {
+		this.net.report(server.name + " has neither a WMS nor a WFS URL")
 		return
 	}
 
+	this.server = index
 	this.connected = true
 	this.connecting = true
-
-	if err := saveUrls(wmsUrl, wfsUrl); err.code != 0 {
-		this.net.report("Cannot save the URLs: " + err.msg)
-	}
-
-	if wmsUrl == wfsUrl {
-		this.net.report("Connecting to " + wmsUrl)
-	} else {
-		this.net.report(sprintf("Connecting to %s%s%s", wmsUrl, wmsUrl != "" && wfsUrl != "" ? " and " : "", wfsUrl))
-	}
-	this.net.post(CapsJob{this, this.session}, true)
+	this.net.report("Connecting to " + server.name)
+	this.net.post(CapsJob{this, this.session, server}, true)
 }
 
 // Panels
@@ -421,47 +420,30 @@ fn (this: ^App) layoutLayerList(gui: ^ui::Gui, height: th::fu) {
 	gui.popContainer()
 }
 
-// A caption and a box for a service URL, which can only be edited while disconnected
-fn (this: ^App) layoutUrl(gui: ^ui::Gui, caption: str, box: ^ui::TextBox, url: str, width: th::fu) {
-	gui.label(this.fit(caption, width), {centerY: true})
-
-	if this.connected {
-		gui.dupStyle()
-		style := gui.getStyle()
-		style.containerBox = style.negBox
-		style.ftColor = disabledColor
-		gui.stack()
-		gui.label(this.fit(url != "" ? url : "None", width - 8), {rect: {4, 0, 0, 0}, centerY: true})
-		gui.popContainer()
-		gui.popStyle()
-	} else {
-		gui.textBox(box)
-	}
-}
-
 fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
 	height := window::wp.y - statusHeight
 	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
 		rect: {padding, padding, panelWidth - 2 * padding, height - 2 * padding}})
 
 	width := panelWidth - 2 * padding
-	this.layoutUrl(gui, "WMS URL, for the base map (optional)", &this.wmsBox, this.wmsUrl, width)
-	this.layoutUrl(gui, "WFS URL, for the features (optional)", &this.wfsBox, this.wfsUrl, width)
+	gui.label("Servers", {centerY: true})
 
-	half := (width - padding) / 2
-	cellRow(gui, {half, half})
-	if captionButton(gui, this.connected ? "Disconnect" : "Connect") {
-		if this.connected {
-			this.disconnect()
-			this.net.report("Disconnected")
-		} else {
-			this.connect(std::trim(this.wmsBox.getBuf()), std::trim(this.wfsBox.getBuf()))
+	// The button of the server connected to stays pressed. Pressing it again disconnects
+	for i, server in this.servers {
+		down := this.connected && i == this.server
+		if captionButton(gui, this.fit(server.name, width - 16), true, down) {
+			if down {
+				this.disconnect()
+				this.net.report("Disconnected")
+			} else {
+				this.connect(i)
+			}
 		}
 	}
+
 	if captionButton(gui, "Fit to extent", this.crs.epsg != 0) {
 		this.view.fit(this.extent)
 	}
-	gui.popContainer()
 
 	if this.tiles != null {
 		if captionButton(gui, this.fit("Base map: " + this.tiles.wms.title, width - 16), true, this.showBaseMap) {
@@ -496,7 +478,15 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 	gui.label(this.fit(layer.title, width - closeWidth - padding), {centerX: true, centerY: true})	
 	gui.popContainer()
 
-	gui.label(this.fit(sprintf(" %s  ·  %s  ·  %d vertices", f.id, f.kindName(), len(vertices)), width), {centerY: true})
+	gui.label(this.fit(" " + f.id, width), {centerY: true})
+
+	// The kind, followed by the number of vertices for lines and polygons
+	kind := f.kindName()
+	if kind == "Point" || kind == "Multipoint" {
+		gui.label(" " + kind, {centerY: true})
+	} else {
+		gui.label(sprintf(" %s  ·  %d vertices", kind, len(vertices)), {centerY: true})
+	}
 
 	// The watched point: the vertex selected on the map, or the point itself, or the center
 	watched, watchedName := f.box.center(), "Center"
@@ -677,8 +667,8 @@ fn (this: ^App) drawStatus() {
 }
 
 // Must be called on the fiber that runs the frame callback, since it creates the worker fibers.
-// The viewer starts disconnected, with the last URLs connected to, or `defaultUrl` for both services
-fn mk*(defaultUrl: str): ^App {
+// The viewer starts disconnected, with the servers listed in `serversFile` to choose from
+fn mk*(): ^App {
 	app := &App{net: net::mk(numWorkers), showBaseMap: true, selection: features::noSelection(), hover: features::noSelection(), hoverVertex: -1}
 
 	app.style = ui::getDefaultStyle()
@@ -694,12 +684,11 @@ fn mk*(defaultUrl: str): ^App {
 	app.panelLayout = |app| {app.layoutPanel(gui)}
 	app.infoLayout = |app| {app.layoutInfo(gui)}
 
-	wmsUrl, wfsUrl := loadUrls()
-	if wmsUrl == "" && wfsUrl == "" {
-		wmsUrl, wfsUrl = defaultUrl, defaultUrl
+	if servers, err := loadServers(serversFile); err.code == 0 {
+		app.servers = servers
+	} else {
+		app.net.report(sprintf("Cannot load %s: %s", serversFile, err.msg))
 	}
-	app.wmsBox.setBuf(wmsUrl)
-	app.wfsBox.setBuf(wfsUrl)
 	return app
 }
 

@@ -1,2 +1,0 @@
-https://geodienste.ch/db/avc_0/deu?SERVICE=WFS&REQUEST=GetCapabilities
-https://geodienste.ch/db/avc_0/deu?SERVICE=WFS&REQUEST=GetCapabilities

@@ -123,7 +123,7 @@ fn (this: ^FeatureJob) run(w: ^net::Worker) {
 	}
 
 	layer.features = features
-	layer.truncated = len(features) >= maxFeatures
+	layer.truncated = len(features) >= maxFeatures || gml::hasMore(&doc)
 	layer.loading = false
 	layer.error = ""
 	this.layers.dirty = true

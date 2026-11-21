@@ -10,6 +10,6 @@ umbox update -c
 umbox run
 ```
 
-The demo shows a base map from a WMS and feature layers from a WFS.
+The demo shows a base map from a WMS and feature layers from a WFS. The servers to choose from are listed in `servers.xml`: the cadastral surveys of Switzerland, Lower Saxony, North Rhine-Westphalia, Norway and the Netherlands. More servers can be added there.
 
 ![](data/screenshot.png)

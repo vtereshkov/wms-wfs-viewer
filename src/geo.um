@@ -86,173 +86,100 @@ fn (this: ^Box) scaled*(factor: real): Box {
 
 const deg = std::pi / 180.0
 
-// Ellipsoids, by the semi-major axis and the squared eccentricity
+// Universal Transverse Mercator on the WGS 84 ellipsoid, after J. P. Snyder, Map Projections - A Working Manual,
+// chapter 8. Accurate to about a millimeter within a zone. ETRS89 differs from WGS 84 by less than a meter
 
 const (
-	wgs84A = 6378137.0
-	wgs84E2 = 1 / 298.257223563 * (2 - 1 / 298.257223563)
-
-	airyA = 6377563.396                                 // Airy 1830, used by OSGB36
-	airyE2 = 1 - 6356256.909 * 6356256.909 / (airyA * airyA)
+	utmA = 6378137.0                                    // Semi-major axis
+	utmF = 1 / 298.257223563                            // Flattening
+	utmE2 = utmF * (2 - utmF)                           // Squared eccentricity
+	utmEp2 = utmE2 / (1 - utmE2)                        // Squared second eccentricity
+	utmK0 = 0.9996                                      // Scale factor on the central meridian
+	utmFalseEasting = 500000.0
+	utmFalseNorthing = 10000000.0                       // In the southern hemisphere
 )
 
-// Transverse Mercator, after J. P. Snyder, Map Projections - A Working Manual, chapter 8.
-// Accurate to about a millimeter within a few degrees of the central meridian
-
-type TransverseMercator = struct {
-	a, e2: real                         // Ellipsoid
-	k0: real                            // Scale factor on the central meridian
-	lat0, lon0: real                    // Origin, in radians
-	falseEasting, falseNorthing: real
-}
-
-// Universal Transverse Mercator on WGS 84. ETRS89 differs from WGS 84 by less than a meter
-fn utm(zone: int, south: bool): TransverseMercator {
-	return {a: wgs84A, e2: wgs84E2, k0: 0.9996, lon0: (zone * 6 - 183) * deg,
-		falseEasting: 500000, falseNorthing: south ? 10000000 : 0}
-}
-
-// British National Grid on OSGB36
-fn britishNationalGrid(): TransverseMercator {
-	return {a: airyA, e2: airyE2, k0: 0.9996012717, lat0: 49 * deg, lon0: -2 * deg,
-		falseEasting: 400000, falseNorthing: -100000}
+fn centralMeridian(zone: int): real {
+	return (zone * 6 - 183) * deg
 }
 
 // Distance along the meridian from the equator to `lat` (in radians)
-fn (this: ^TransverseMercator) meridianArc(lat: real): real {
-	e2, e4, e6 := this.e2, this.e2 * this.e2, this.e2 * this.e2 * this.e2
-	return this.a * ((1 - e2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * lat -
+fn meridianArc(lat: real): real {
+	const (
+		e2 = utmE2
+		e4 = utmE2 * utmE2
+		e6 = utmE2 * utmE2 * utmE2
+	)
+	return utmA * ((1 - e2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * lat -
 		(3 * e2 / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * sin(2 * lat) +
 		(15 * e4 / 256 + 45 * e6 / 1024) * sin(4 * lat) -
 		35 * e6 / 3072 * sin(6 * lat))
 }
 
-// Projects {lon, lat} given on the ellipsoid of the projection
-fn (this: ^TransverseMercator) project(p: Point): Point {
-	ep2 := this.e2 / (1 - this.e2)       // Squared second eccentricity
+fn utmFromWgs84(p: Point, zone: int, south: bool): Point {
 	lat := p.y * deg
 	s, c := sin(lat), cos(lat)
 
-	n := this.a / sqrt(1 - this.e2 * s * s)
+	n := utmA / sqrt(1 - utmE2 * s * s)
 	t := s * s / (c * c)
-	cc := ep2 * c * c
-	a := c * (p.x * deg - this.lon0)
+	cc := utmEp2 * c * c
+	a := c * (p.x * deg - centralMeridian(zone))
 	a2 := a * a
 
-	x := this.k0 * n * a * (1 + a2 / 6 * ((1 - t + cc) + a2 / 20 * (5 - 18 * t + t * t + 72 * cc - 58 * ep2)))
-	y := this.k0 * (this.meridianArc(lat) - this.meridianArc(this.lat0) +
-		n * s / c * a2 * (0.5 + a2 / 24 * ((5 - t + 9 * cc + 4 * cc * cc) + a2 / 30 * (61 - 58 * t + t * t + 600 * cc - 330 * ep2))))
+	x := utmK0 * n * a * (1 + a2 / 6 * ((1 - t + cc) + a2 / 20 * (5 - 18 * t + t * t + 72 * cc - 58 * utmEp2)))
+	y := utmK0 * (meridianArc(lat) + n * s / c * a2 * (0.5 + a2 / 24 * ((5 - t + 9 * cc + 4 * cc * cc) + a2 / 30 * (61 - 58 * t + t * t + 600 * cc - 330 * utmEp2))))
 
-	return {this.falseEasting + x, this.falseNorthing + y}
+	return {utmFalseEasting + x, south ? utmFalseNorthing + y : y}
 }
 
-// Returns {lon, lat} on the ellipsoid of the projection
-fn (this: ^TransverseMercator) unproject(p: Point): Point {
-	e2, ep2 := this.e2, this.e2 / (1 - this.e2)
-	x := p.x - this.falseEasting
-	m := this.meridianArc(this.lat0) + (p.y - this.falseNorthing) / this.k0
+fn utmToWgs84(p: Point, zone: int, south: bool): Point {
+	x := p.x - utmFalseEasting
+	y := south ? p.y - utmFalseNorthing : p.y
 
 	// Footpoint latitude
-	e1 := (1 - sqrt(1 - e2)) / (1 + sqrt(1 - e2))
-	mu := m / (this.a * (1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * e2 * e2 * e2 / 256))
+	e1 := (1 - sqrt(1 - utmE2)) / (1 + sqrt(1 - utmE2))
+	mu := y / utmK0 / (utmA * (1 - utmE2 / 4 - 3 * utmE2 * utmE2 / 64 - 5 * utmE2 * utmE2 * utmE2 / 256))
 	lat1 := mu + (3 * e1 / 2 - 27 * e1 * e1 * e1 / 32) * sin(2 * mu) + (21 * e1 * e1 / 16 - 55 * e1 * e1 * e1 * e1 / 32) * sin(4 * mu) +
 		151 * e1 * e1 * e1 / 96 * sin(6 * mu) + 1097 * e1 * e1 * e1 * e1 / 512 * sin(8 * mu)
 
 	s, c := sin(lat1), cos(lat1)
 	t := s * s / (c * c)
-	cc := ep2 * c * c
-	w := 1 - e2 * s * s
-	n := this.a / sqrt(w)
-	r := this.a * (1 - e2) / (w * sqrt(w))
-	d := x / (n * this.k0)
+	cc := utmEp2 * c * c
+	w := 1 - utmE2 * s * s
+	n := utmA / sqrt(w)
+	r := utmA * (1 - utmE2) / (w * sqrt(w))
+	d := x / (n * utmK0)
 	d2 := d * d
 
-	lat := lat1 - n * s / c / r * d2 * (0.5 - d2 / 24 * ((5 + 3 * t + 10 * cc - 4 * cc * cc - 9 * ep2) - d2 / 30 * (61 + 90 * t + 298 * cc + 45 * t * t - 252 * ep2 - 3 * cc * cc)))
-	lon := this.lon0 + d * (1 - d2 / 6 * ((1 + 2 * t + cc) - d2 / 20 * (5 - 2 * cc + 28 * t - 3 * cc * cc + 8 * ep2 + 24 * t * t))) / c
+	lat := lat1 - n * s / c / r * d2 * (0.5 - d2 / 24 * ((5 + 3 * t + 10 * cc - 4 * cc * cc - 9 * utmEp2) - d2 / 30 * (61 + 90 * t + 298 * cc + 45 * t * t - 252 * utmEp2 - 3 * cc * cc)))
+	lon := centralMeridian(zone) + d * (1 - d2 / 6 * ((1 + 2 * t + cc) - d2 / 20 * (5 - 2 * cc + 28 * t - 3 * cc * cc + 8 * utmEp2 + 24 * t * t))) / c
 
 	return {lon / deg, lat / deg}
-}
-
-// Datum shifts go through geocentric Cartesian coordinates. Heights are taken as zero
-
-type Geocentric = struct {
-	x, y, z: real
-}
-
-fn toGeocentric(p: Point, a, e2: real): Geocentric {
-	lat, lon := p.y * deg, p.x * deg
-	n := a / sqrt(1 - e2 * sin(lat) * sin(lat))
-	return {n * cos(lat) * cos(lon), n * cos(lat) * sin(lon), n * (1 - e2) * sin(lat)}
-}
-
-fn fromGeocentric(g: Geocentric, a, e2: real): Point {
-	p := sqrt(g.x * g.x + g.y * g.y)
-	lat := atan2(g.z, p * (1 - e2))
-	for i := 0; i < 4; i++ {            // Converges to well below a millimeter
-		n := a / sqrt(1 - e2 * sin(lat) * sin(lat))
-		lat = atan2(g.z + e2 * n * sin(lat), p)
-	}
-	return {atan2(g.y, g.x) / deg, lat / deg}
-}
-
-// The Helmert transformation from WGS 84 (or ETRS89) to OSGB36 given by Ordnance Survey in
-// A Guide to Coordinate Systems in Great Britain, section 6.6. Accurate to about 5 m.
-// With `sign` = -1, applies the inverse, approximated by negating the parameters, which costs a few centimeters
-fn helmertToOsgb36(g: Geocentric, sign: real): Geocentric {
-	const (
-		tx = -446.448                   // Meters
-		ty = 125.157
-		tz = -542.060
-		s = 20.4894e-6                  // Scale change
-		rx = -0.1502 / 3600 * deg       // Rotations
-		ry = -0.2470 / 3600 * deg
-		rz = -0.8421 / 3600 * deg
-	)
-
-	k := 1 + sign * s
-	return {
-		sign * (tx - rz * g.y + ry * g.z) + k * g.x,
-		sign * (ty + rz * g.x - rx * g.z) + k * g.y,
-		sign * (tz - ry * g.x + rx * g.y) + k * g.z}
-}
-
-fn wgs84ToOsgb36(p: Point): Point {
-	return fromGeocentric(helmertToOsgb36(toGeocentric(p, wgs84A, wgs84E2), 1), airyA, airyE2)
-}
-
-fn osgb36ToWgs84(p: Point): Point {
-	return fromGeocentric(helmertToOsgb36(toGeocentric(p, airyA, airyE2), -1), wgs84A, wgs84E2)
 }
 
 type Crs* = struct {
 	epsg: int
 }
 
-// National grids, preferred within their areas of use ({lon, lat})
-type NationalGrid = struct {
-	epsg: int
-	area: Box
-}
-
-// In the order of preference for the data around `center` ({lon, lat}): a national grid, the local UTM zone, Web Mercator, WGS 84
+// In the order of preference for the data around `center` ({lon, lat}): Swiss LV95, the local UTM zone and its neighbors,
+// Web Mercator, WGS 84. LV95 is only offered in Switzerland, since its formulas are invalid elsewhere and some servers
+// list every CRS. The neighboring zones are offered, since a country often uses one zone for all its data
 fn candidateCrs*(center: Point): []Crs {
-	grids := []NationalGrid{
-		{2056, {{5.96, 45.82}, {10.49, 47.81}}},        // Swiss LV95
-		{27700, {{-9.01, 49.75}, {2.01, 61.01}}}}       // British National Grid
-
 	res := []Crs{}
-	for _, grid^ in grids {
-		if grid.area.contains(center) {
-			res = append(res, Crs{grid.epsg})
-		}
+	if switzerland := Box{{5.96, 45.82}, {10.49, 47.81}}; switzerland.contains(center) {
+		res = append(res, Crs{2056})
 	}
 
 	zone := floor((center.x + 180) / 6) + 1
 	if zone < 1 {zone = 1}
 	if zone > 60 {zone = 60}
 
-	utmCrs := center.y >= 0 ? []Crs{{32600 + zone}, {25800 + zone}} : []Crs{{32700 + zone}}
-	return append(append(res, utmCrs), []Crs{{3857}, {4326}})
+	for _, z in []int{zone, zone - 1, zone + 1} {
+		if z >= 1 && z <= 60 {
+			res = append(res, center.y >= 0 ? []Crs{{32600 + z}, {25800 + z}} : []Crs{{32700 + z}})
+		}
+	}
+	return append(res, []Crs{{3857}, {4326}})
 }
 
 // Extracts the EPSG code from "EPSG:2056", "urn:ogc:def:crs:EPSG::2056", "http://www.opengis.net/def/crs/EPSG/0/2056", etc.
@@ -284,7 +211,6 @@ fn (this: ^Crs) latFirst*(): bool {
 	return this.isGeographic()
 }
 
-// All the projected CRSs supported are in meters
 fn (this: ^Crs) metersPerUnit*(): real {
 	return this.isGeographic() ? 111320.0 : 1.0
 }
@@ -299,8 +225,7 @@ fn (this: ^Crs) utmZone*(): (int, bool) {
 
 fn (this: ^Crs) toWgs84*(p: Point): Point {
 	if zone, south := this.utmZone(); zone > 0 {
-		tm := utm(zone, south)
-		return tm.unproject(p)
+		return utmToWgs84(p, zone, south)
 	}
 
 	switch this.epsg {
@@ -315,18 +240,13 @@ fn (this: ^Crs) toWgs84*(p: Point): Point {
 		case 3857:
 			const r = 6378137.0
 			return {p.x / r / deg, (2 * atan(exp(p.y / r)) - std::pi / 2) / deg}
-
-		case 27700:
-			grid := britishNationalGrid()
-			return osgb36ToWgs84(grid.unproject(p))
 	}
 	return p
 }
 
 fn (this: ^Crs) fromWgs84*(p: Point): Point {
 	if zone, south := this.utmZone(); zone > 0 {
-		tm := utm(zone, south)
-		return tm.project(p)
+		return utmFromWgs84(p, zone, south)
 	}
 
 	switch this.epsg {
@@ -340,10 +260,6 @@ fn (this: ^Crs) fromWgs84*(p: Point): Point {
 		case 3857:
 			const r = 6378137.0
 			return {p.x * deg * r, r * log(sin(std::pi / 4 + p.y * deg / 2) / cos(std::pi / 4 + p.y * deg / 2))}
-
-		case 27700:
-			grid := britishNationalGrid()
-			return grid.project(wgs84ToOsgb36(p))
 	}
 	return p
 }
