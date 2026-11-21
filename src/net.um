@@ -26,6 +26,7 @@ type (
 	Net* = struct {
 		queue: []Job
 		workers: []^Worker
+		next: int           // Index of the worker to resume first in the next call to `run`
 		epoch: int          // Incremented to cancel all the jobs
 		numRequests, numFailures, numBytes: int
 		messages: []str
@@ -85,19 +86,18 @@ fn (this: ^Worker) cancelled*(): bool {
 	return this.epoch != this.net.epoch
 }
 
-// Resumes the workers until all of them are waiting or idle, or until the time budget (in seconds) is exhausted
+// Resumes the workers in turn until all of them are waiting or idle, or until the time budget (in seconds) is exhausted.
+// The budget is checked before each worker, so it is exceeded by one slice of work at most, and the next call
+// continues with the next worker, so that all of them make progress
 fn (this: ^Net) run*(budget: real) {
 	deadline := std::clock() + budget
-	for true {
-		busy := false
-		for _, w in this.workers {
-			resume(w.fib)
-			busy = busy || w.busy
-		}
+	numIdle := 0        // Workers resumed in a row that were not busy
+	for numIdle < len(this.workers) && std::clock() <= deadline {
+		w := this.workers[this.next]
+		this.next = (this.next + 1) % len(this.workers)
 
-		if !busy || std::clock() > deadline {
-			break
-		}
+		resume(w.fib)
+		numIdle = w.busy ? 0 : numIdle + 1
 	}
 }
 

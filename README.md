@@ -10,6 +10,6 @@ umbox update -c
 umbox run
 ```
 
-The demo requires a server that provides both WMS and WFS data. 
+The demo shows a base map from a WMS and feature layers from a WFS.
 
 ![](data/screenshot.png)

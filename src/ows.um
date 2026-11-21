@@ -72,6 +72,33 @@ fn capabilitiesUrl*(url, service: str): str {
 	return parts[0] + "?" + strings::join(query, "&")
 }
 
+fn hostOf(url: str): str {
+	start := 0
+	for i := 0; i + 2 < len(url); i++ {
+		if url[i] == ':' && url[i + 1] == '/' && url[i + 2] == '/' {
+			start = i + 3
+			break
+		}
+	}
+	end := start
+	for end < len(url) && url[end] != '/' && url[end] != '?' {
+		end++
+	}
+	return slice(url, start, end)
+}
+
+// Servers behind TLS proxies often advertise http:// operation URLs, though they are reached by https://.
+// Such a URL on the same host as the capabilities is upgraded to https://
+fn upgradeScheme(advertised, capsUrl: str): str {
+	if !strings::has_prefix(capsUrl, "https://") || !strings::has_prefix(advertised, "http://") {
+		return advertised
+	}
+	if hostOf(advertised) != hostOf(capsUrl) {
+		return advertised
+	}
+	return "https://" + slice(advertised, len("http://"))
+}
+
 // Capabilities parsing
 
 fn readCrs(crs: map[int]bool, text: str) {
@@ -118,7 +145,8 @@ fn (this: ^Wms) readLayer(layer: ^xml::Node): bool {
 	return false
 }
 
-fn parseWms*(doc: ^xml::Node): (Wms, std::Err) {
+// Parses WMS capabilities fetched from `capsUrl`
+fn parseWms*(doc: ^xml::Node, capsUrl: str): (Wms, std::Err) {
 	root := doc.child("WMS_Capabilities")
 	if root == null {
 		root = doc.child("WMT_MS_Capabilities")
@@ -135,7 +163,7 @@ fn parseWms*(doc: ^xml::Node): (Wms, std::Err) {
 	}
 
 	if res := getMap.path("DCPType/HTTP/Get/OnlineResource"); res != null {
-		wms.getMapUrl = res.attr("xlink:href")
+		wms.getMapUrl = upgradeScheme(res.attr("xlink:href"), capsUrl)
 	}
 
 	for _, format in getMap.childrenNamed("Format") {
@@ -154,7 +182,8 @@ fn parseWms*(doc: ^xml::Node): (Wms, std::Err) {
 	return wms, {}
 }
 
-fn parseWfs*(doc: ^xml::Node): (Wfs, std::Err) {
+// Parses WFS capabilities fetched from `capsUrl`
+fn parseWfs*(doc: ^xml::Node, capsUrl: str): (Wfs, std::Err) {
 	root := doc.child("WFS_Capabilities")
 	if root == null {
 		return {}, std::error(1, "Not a WFS capabilities document")
@@ -175,6 +204,7 @@ fn parseWfs*(doc: ^xml::Node): (Wfs, std::Err) {
 	if wfs.getFeatureUrl == "" {
 		return {}, std::error(1, "WFS has no GetFeature operation")
 	}
+	wfs.getFeatureUrl = upgradeScheme(wfs.getFeatureUrl, capsUrl)
 
 	if list := root.child("FeatureTypeList"); list != null {
 		for _, ft in list.childrenNamed("FeatureType") {
@@ -200,6 +230,29 @@ fn parseWfs*(doc: ^xml::Node): (Wfs, std::Err) {
 	}
 
 	return wfs, {}
+}
+
+// The typical extent of the feature types: the median of each bound. Some servers advertise a few wrong
+// or very large extents, which would spoil their union
+fn (this: ^Wfs) typicalExtent*(): geo::Box {
+	minX, minY, maxX, maxY := []real{}, []real{}, []real{}, []real{}
+	for _, ft in this.featureTypes {
+		if !ft.extent.isEmpty() {
+			minX = append(minX, ft.extent.min.x)
+			minY = append(minY, ft.extent.min.y)
+			maxX = append(maxX, ft.extent.max.x)
+			maxY = append(maxY, ft.extent.max.y)
+		}
+	}
+	if len(minX) == 0 {
+		return geo::emptyBox()
+	}
+
+	const median = fn (values: []real): real {
+		sort(values, true)
+		return values[len(values) / 2]
+	}
+	return {{median(minX), median(minY)}, {median(maxX), median(maxY)}}
 }
 
 // Requests

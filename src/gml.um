@@ -42,20 +42,17 @@ fn isGeometry(name: str): bool {
 	return false
 }
 
-fn isSeparator(c: char): bool {
-	return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == ','
-}
-
 // Parses "x1 y1 x2 y2 ..." or "x1,y1 x2,y2 ..."
 fn parseCoords(text: str, dim: int, latFirst: bool): []geo::Point {
+	separators := xml::charSet(" \n\r\t,")
 	values := []real{}
 	i := 0
 	for i < len(text) {
-		for i < len(text) && isSeparator(text[i]) {
+		for i < len(text) && separators[int(text[i])] {
 			i++
 		}
 		start := i
-		for i < len(text) && !isSeparator(text[i]) {
+		for i < len(text) && !separators[int(text[i])] {
 			i++
 		}
 		if i > start {

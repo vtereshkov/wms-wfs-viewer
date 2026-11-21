@@ -12,6 +12,8 @@ import (
 	"utf8.um"
 	"window.um"
 
+	"../umbox/strings/strings.um"
+
 	"features.um"
 	"geo.um"
 	"net.um"
@@ -31,7 +33,7 @@ const (
 	clickDistance = 4           // Pixels the mouse may move between pressing and releasing for a click
 	zoomStep = 1.25
 	cacheDir = "cache"
-	urlFile = "last_url.txt"
+	urlFile = "last_url.txt"        // The WMS URL and the WFS URL, one per line
 
 	mapColor = 0xF2EFE9FF
 	panelColor = 0xE4E4E4FF
@@ -46,15 +48,15 @@ const (
 type (
 	App* = struct {
 		net: ^net::Net
-		url: str
+		wmsUrl, wfsUrl: str             // Either may be empty, but not both
 		session: int                    // Incremented on each connection, so that outdated capabilities are ignored
 		connected: bool                 // Connected or connecting
 		connecting: bool                // Waiting for the capabilities
 		crs: geo::Crs
 		extent: geo::Box
 		view: view::View
-		tiles: ^tiles::Tiles            // null if the server has no WMS
-		layers: ^features::Layers       // null if the server has no WFS
+		tiles: ^tiles::Tiles            // null if there is no WMS
+		layers: ^features::Layers       // null if there is no WFS
 		showBaseMap: bool
 		selection, hover: features::Selection
 		hoverVertex: int                // Vertex of the selected feature under the mouse, or -1
@@ -64,7 +66,7 @@ type (
 		panel, info: ui::Gui
 		panelLayout, infoLayout: ui::LayoutFn
 		guiDims: th::Vf2
-		urlBox: ui::TextBox
+		wmsBox, wfsBox: ui::TextBox
 		layerScroll, infoScroll: real32
 
 		dragging: bool
@@ -138,17 +140,14 @@ fn supportsCrs(wfs: ^ows::Wfs, epsg: int): bool {
 
 // Prepares the map for the services found. Returns false if they cannot be used
 fn (this: ^App) setup(wms: ^ows::Wms, wfs: ^ows::Wfs): bool {
-	// The extent comes first, since the preferred CRS depends on where the data are
+	// The extent comes first, since the preferred CRS depends on where the data are. The features are preferred,
+	// since the base map may come from another server and cover a much larger area
 	extent := geo::emptyBox()
-	if wms != null {
+	if wfs != null {
+		extent = wfs.typicalExtent()
+	}
+	if extent.isEmpty() && wms != null {
 		extent = wms.extent
-	} else {
-		for _, ft in wfs.featureTypes {
-			if !ft.extent.isEmpty() {
-				extent.add(ft.extent.min)
-				extent.add(ft.extent.max)
-			}
-		}
 	}
 	if extent.isEmpty() {
 		extent = {{-180, -85}, {180, 85}}
@@ -185,12 +184,13 @@ fn (this: ^App) setup(wms: ^ows::Wms, wfs: ^ows::Wfs): bool {
 }
 
 fn loadWms(w: ^net::Worker, url: str): (^ows::Wms, std::Err) {
-	doc, err := ows::fetchXml(w, ows::capabilitiesUrl(url, "WMS"))
+	capsUrl := ows::capabilitiesUrl(url, "WMS")
+	doc, err := ows::fetchXml(w, capsUrl)
 	if err.code != 0 {
 		return null, err
 	}
 
-	wms, err := ows::parseWms(&doc)
+	wms, err := ows::parseWms(&doc, capsUrl)
 	if err.code != 0 {
 		return null, err
 	}
@@ -198,12 +198,13 @@ fn loadWms(w: ^net::Worker, url: str): (^ows::Wms, std::Err) {
 }
 
 fn loadWfs(w: ^net::Worker, url: str): (^ows::Wfs, std::Err) {
-	doc, err := ows::fetchXml(w, ows::capabilitiesUrl(url, "WFS"))
+	capsUrl := ows::capabilitiesUrl(url, "WFS")
+	doc, err := ows::fetchXml(w, capsUrl)
 	if err.code != 0 {
 		return null, err
 	}
 
-	wfs, err := ows::parseWfs(&doc)
+	wfs, err := ows::parseWfs(&doc, capsUrl)
 	if err.code != 0 {
 		return null, err
 	}
@@ -214,8 +215,15 @@ fn (this: ^CapsJob) run(w: ^net::Worker) {
 	w.task = "Capabilities"
 	app := this.app
 
-	wms, wmsErr := loadWms(w, app.url)
-	wfs, wfsErr := loadWfs(w, app.url)
+	var wms: ^ows::Wms
+	var wfs: ^ows::Wfs
+	var wmsErr, wfsErr: std::Err
+	if app.wmsUrl != "" {
+		wms, wmsErr = loadWms(w, app.wmsUrl)
+	}
+	if app.wfsUrl != "" {
+		wfs, wfsErr = loadWfs(w, app.wfsUrl)
+	}
 	if w.cancelled() || this.session != app.session {
 		return
 	}
@@ -228,29 +236,40 @@ fn (this: ^CapsJob) run(w: ^net::Worker) {
 		app.net.report("No WFS: " + wfsErr.msg)
 	}
 	if wms == null && wfs == null {
-		app.net.report("No services found at " + app.url)
+		app.net.report("No services found")
 		app.connected = false
 		return
 	}
 	app.connected = app.setup(wms, wfs)
 }
 
-fn loadUrl(): str {
+// Returns the WMS URL and the WFS URL last connected to. A single line, as written by earlier versions, is used for both
+fn loadUrls(): (str, str) {
 	f, err := std::fopen(urlFile, "rb")
 	if err.code != 0 {
-		return ""
+		return "", ""
 	}
 	data, err := std::freadall(f)
 	std::fclose(f)
-	return std::trim(data)
+
+	text := str(data)
+	if len(text) > 0 && text[len(text) - 1] == '\n' {
+		text = slice(text, 0, len(text) - 1)
+	}
+
+	lines := strings::split(text, "\n")
+	if len(lines) == 1 {
+		return std::trim(lines[0]), std::trim(lines[0])
+	}
+	return std::trim(lines[0]), std::trim(lines[1])
 }
 
-fn saveUrl(url: str): std::Err {
+fn saveUrls(wmsUrl, wfsUrl: str): std::Err {
 	f, err := std::fopen(urlFile, "wb")
 	if err.code != 0 {
 		return err
 	}
-	fprintf(f, "%s\n", url)
+	fprintf(f, "%s\n%s\n", wmsUrl, wfsUrl)
 	return std::fclose(f)
 }
 
@@ -267,18 +286,30 @@ fn (this: ^App) disconnect*() {
 	this.net.cancelAll()
 }
 
-fn (this: ^App) connect*(url: str) {
+// Connects to a WMS for the base map and a WFS for the feature layers. Either URL may be empty
+fn (this: ^App) connect*(wmsUrl, wfsUrl: str) {
 	this.disconnect()
-	this.url = url
-	this.urlBox.setBuf(url)
+	this.wmsUrl, this.wfsUrl = wmsUrl, wfsUrl
+	this.wmsBox.setBuf(wmsUrl)
+	this.wfsBox.setBuf(wfsUrl)
+
+	if wmsUrl == "" && wfsUrl == "" {
+		this.net.report("Enter a WMS URL, a WFS URL or both")
+		return
+	}
+
 	this.connected = true
 	this.connecting = true
 
-	if err := saveUrl(url); err.code != 0 {
-		this.net.report("Cannot save the URL: " + err.msg)
+	if err := saveUrls(wmsUrl, wfsUrl); err.code != 0 {
+		this.net.report("Cannot save the URLs: " + err.msg)
 	}
 
-	this.net.report("Connecting to " + url)
+	if wmsUrl == wfsUrl {
+		this.net.report("Connecting to " + wmsUrl)
+	} else {
+		this.net.report(sprintf("Connecting to %s%s%s", wmsUrl, wmsUrl != "" && wfsUrl != "" ? " and " : "", wfsUrl))
+	}
 	this.net.post(CapsJob{this, this.session}, true)
 }
 
@@ -390,27 +421,32 @@ fn (this: ^App) layoutLayerList(gui: ^ui::Gui, height: th::fu) {
 	gui.popContainer()
 }
 
-fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
-	height := window::wp.y - statusHeight
-	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
-		rect: {padding, padding, panelWidth - 2 * padding, height - 2 * padding}})
+// A caption and a box for a service URL, which can only be edited while disconnected
+fn (this: ^App) layoutUrl(gui: ^ui::Gui, caption: str, box: ^ui::TextBox, url: str, width: th::fu) {
+	gui.label(this.fit(caption, width), {centerY: true})
 
-	width := panelWidth - 2 * padding
-	gui.label(this.fit("Server URL (WMS/WFS endpoint or capabilities)", width), {centerY: true})
-
-	// The URL can only be edited while disconnected
 	if this.connected {
 		gui.dupStyle()
 		style := gui.getStyle()
 		style.containerBox = style.negBox
 		style.ftColor = disabledColor
 		gui.stack()
-		gui.label(this.fit(this.url, width - 8), {rect: {4, 0, 0, 0}, centerY: true})
+		gui.label(this.fit(url != "" ? url : "None", width - 8), {rect: {4, 0, 0, 0}, centerY: true})
 		gui.popContainer()
 		gui.popStyle()
 	} else {
-		gui.textBox(&this.urlBox)
+		gui.textBox(box)
 	}
+}
+
+fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
+	height := window::wp.y - statusHeight
+	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: padding,
+		rect: {padding, padding, panelWidth - 2 * padding, height - 2 * padding}})
+
+	width := panelWidth - 2 * padding
+	this.layoutUrl(gui, "WMS URL, for the base map (optional)", &this.wmsBox, this.wmsUrl, width)
+	this.layoutUrl(gui, "WFS URL, for the features (optional)", &this.wfsBox, this.wfsUrl, width)
 
 	half := (width - padding) / 2
 	cellRow(gui, {half, half})
@@ -419,7 +455,7 @@ fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
 			this.disconnect()
 			this.net.report("Disconnected")
 		} else {
-			this.connect(std::trim(this.urlBox.getBuf()))
+			this.connect(std::trim(this.wmsBox.getBuf()), std::trim(this.wfsBox.getBuf()))
 		}
 	}
 	if captionButton(gui, "Fit to extent", this.crs.epsg != 0) {
@@ -641,7 +677,7 @@ fn (this: ^App) drawStatus() {
 }
 
 // Must be called on the fiber that runs the frame callback, since it creates the worker fibers.
-// The viewer starts disconnected, with the last URL connected to, or `defaultUrl`
+// The viewer starts disconnected, with the last URLs connected to, or `defaultUrl` for both services
 fn mk*(defaultUrl: str): ^App {
 	app := &App{net: net::mk(numWorkers), showBaseMap: true, selection: features::noSelection(), hover: features::noSelection(), hoverVertex: -1}
 
@@ -658,8 +694,12 @@ fn mk*(defaultUrl: str): ^App {
 	app.panelLayout = |app| {app.layoutPanel(gui)}
 	app.infoLayout = |app| {app.layoutInfo(gui)}
 
-	url := loadUrl()
-	app.urlBox.setBuf(url != "" ? url : defaultUrl)
+	wmsUrl, wfsUrl := loadUrls()
+	if wmsUrl == "" && wfsUrl == "" {
+		wmsUrl, wfsUrl = defaultUrl, defaultUrl
+	}
+	app.wmsBox.setBuf(wmsUrl)
+	app.wfsBox.setBuf(wfsUrl)
 	return app
 }
 

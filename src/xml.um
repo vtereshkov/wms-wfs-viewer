@@ -1,6 +1,9 @@
 // A small non-validating XML parser, good enough for OGC service responses.
 // Declarations, comments, processing instructions and DOCTYPEs are skipped.
 // Only leaf elements keep their text, so mixed content is not supported.
+//
+// WFS responses can be tens of megabytes, so the parser works with indices into the document
+// and slices out only the strings it keeps
 
 import "std.um"
 
@@ -18,8 +21,15 @@ fn isSpace(c: char): bool {
 	return c == ' ' || c == '\n' || c == '\r' || c == '\t'
 }
 
-fn isNameEnd(c: char): bool {
-	return isSpace(c) || c == '>' || c == '/' || c == '='
+// A character class as a lookup table, which is much faster than a function call
+type CharSet* = [256]bool
+
+fn charSet*(chars: str): CharSet {
+	var set: CharSet
+	for _, c in chars {
+		set[int(c)] = true
+	}
+	return set
 }
 
 fn parseHex(s: str): int {
@@ -104,14 +114,38 @@ fn splitName(qname: str): (str, str) {
 	return "", qname
 }
 
+// True if `s` contains `word` at index `i`
+fn hasAt(s: str, i: int, word: str): bool {
+	if i + len(word) > len(s) {
+		return false
+	}
+	for k, c in word {
+		if s[i + k] != c {
+			return false
+		}
+	}
+	return true
+}
+
 fn skipPast(s: str, i: int, terminator: str): int {
 	for i < len(s) {
-		if s[i] == terminator[0] && slice(s, i, i + len(terminator)) == terminator {
+		if s[i] == terminator[0] && hasAt(s, i, terminator) {
 			return i + len(terminator)
 		}
 		i++
 	}
 	return i
+}
+
+// Returns s[from:to] without the leading and trailing whitespace
+fn trimmedSlice(s: str, from, to: int): str {
+	for from < to && isSpace(s[from]) {
+		from++
+	}
+	for to > from && isSpace(s[to - 1]) {
+		to--
+	}
+	return slice(s, from, to)
 }
 
 // Parses `s` into a tree whose root is a "#document" node. Yields to the parent fiber from time to time,
@@ -122,13 +156,24 @@ fn parse*(s: str): (Node, std::Err) {
 		contentStart: int
 	}
 
+	type Name = struct {
+		prefix, local: str
+	}
+
+	spaces, nameEnds := charSet(" \n\r\t"), charSet(" \n\r\t>/=")
+
 	nodes := []Node{{name: "#document"}}
 	open := []Open{{}}
+	names := map[str]Name{}     // Element names repeat a lot, so each one is split only once
+	lastAmp := -1               // Index of the latest '&' outside tags: texts without one need no unescaping
 	numTags := 0
 
 	i := 0
 	for i < len(s) {
-		if s[i] != '<' {
+		if c := s[i]; c != '<' {
+			if c == '&' {
+				lastAmp = i
+			}
 			i++
 			continue
 		}
@@ -143,9 +188,9 @@ fn parse*(s: str): (Node, std::Err) {
 		if next == '?' {
 			i = skipPast(s, i, "?>")
 		} else if next == '!' {
-			if slice(s, i, i + 4) == "<!--" {
+			if hasAt(s, i, "<!--") {
 				i = skipPast(s, i, "-->")
-			} else if slice(s, i, i + 9) == "<![CDATA[" {
+			} else if hasAt(s, i, "<![CDATA[") {
 				i = skipPast(s, i, "]]>")
 			} else {
 				i = skipPast(s, i, ">")
@@ -154,11 +199,11 @@ fn parse*(s: str): (Node, std::Err) {
 			// End tag
 			start := i + 2
 			i = start
-			for i < len(s) && s[i] != '>' {
+			for i < len(s) && !nameEnds[int(s[i])] {
 				i++
 			}
-			qname := std::trim(slice(s, start, i))
-			i++
+			qname := slice(s, start, i)
+			i = skipPast(s, i, ">")
 
 			top := len(nodes) - 1
 			if top == 0 || open[top].qname != qname {
@@ -167,7 +212,11 @@ fn parse*(s: str): (Node, std::Err) {
 
 			node := nodes[top]
 			if len(node.children) == 0 {
-				node.text = unescape(std::trim(slice(s, open[top].contentStart, start - 2)))
+				contentStart := open[top].contentStart
+				node.text = trimmedSlice(s, contentStart, start - 2)
+				if lastAmp >= contentStart {
+					node.text = unescape(node.text)
+				}
 			}
 
 			nodes = delete(nodes, top)
@@ -177,18 +226,22 @@ fn parse*(s: str): (Node, std::Err) {
 			// Start tag
 			start := i + 1
 			i = start
-			for i < len(s) && !isNameEnd(s[i]) {
+			for i < len(s) && !nameEnds[int(s[i])] {
 				i++
 			}
 
-			node := Node{}
 			qname := slice(s, start, i)
-			node.prefix, node.name = splitName(qname)
+			name := names[qname]
+			if name.local == "" {
+				name.prefix, name.local = splitName(qname)
+				names[qname] = name
+			}
+			node := Node{prefix: name.prefix, name: name.local}
 
 			// Attributes
 			selfClosing := false
 			for i < len(s) {
-				for i < len(s) && isSpace(s[i]) {
+				for i < len(s) && spaces[int(s[i])] {
 					i++
 				}
 				if i >= len(s) {
@@ -205,7 +258,7 @@ fn parse*(s: str): (Node, std::Err) {
 				}
 
 				nameStart := i
-				for i < len(s) && !isNameEnd(s[i]) {
+				for i < len(s) && !nameEnds[int(s[i])] {
 					i++
 				}
 				attrName := slice(s, nameStart, i)
