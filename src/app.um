@@ -28,6 +28,7 @@ const (
 	statusHeight = 26
 	rowHeight = 26
 	scrollBarWidth = 12
+	maxScaleBarLength = 150     // Pixels
 	padding = 4
 	fontSize = 16
 	clickDistance = 4           // Pixels the mouse may move between pressing and releasing for a click
@@ -605,6 +606,41 @@ fn (this: ^App) drawHint(text: str) {
 	this.ft.draw(text, {r.x + 8, r.y + 4}, th::white)
 }
 
+// The longest round length, 1, 2 or 5 times a power of ten, not exceeding `maxMeters`
+fn roundLength(maxMeters: real): real {
+	length := 1.0
+	for length * 10 <= maxMeters {
+		length *= 10
+	}
+	if 5 * length <= maxMeters {
+		return 5 * length
+	}
+	if 2 * length <= maxMeters {
+		return 2 * length
+	}
+	return length
+}
+
+// A bar of a round length in the bottom left corner of the map, on a box like that of the hints
+fn (this: ^App) drawScaleBar() {
+	metersPerPixel := this.view.res * this.crs.metersPerUnit()
+	meters := roundLength(maxScaleBarLength * metersPerPixel)
+	length := th::fu(meters / metersPerPixel)
+	label := meters >= 1000 ? grouped(meters / 1000, 0) + " km" : sprintf("%.0f m", meters)
+
+	size := this.ft.measure(label)
+	w, h := (length > size.x ? length : size.x) + 16, size.y + 16
+	r := rect::mk(this.view.rect.x + 12, this.view.rect.y + this.view.rect.h - 12 - h, w, h)
+	canvas::drawRect(0x000000A0, r)
+	this.ft.draw(label, {r.x + (w - size.x) / 2, r.y + 4}, th::white)
+
+	// The bar with ticks at its ends, under the label
+	x0, x1, y := r.x + (w - length) / 2, r.x + (w + length) / 2, r.y + h - 5
+	canvas::drawLine(th::white, {x0, y}, {x1, y}, 2)
+	canvas::drawLine(th::white, {x0, y - 5}, {x0, y + 1}, 2)
+	canvas::drawLine(th::white, {x1, y - 5}, {x1, y + 1}, 2)
+}
+
 fn (this: ^App) drawMap() {
 	canvas::beginScissorRect(this.view.rect)
 	canvas::drawRect(mapColor, this.view.rect)
@@ -617,6 +653,10 @@ fn (this: ^App) drawMap() {
 		this.layers.draw(&this.view)
 		this.layers.drawSelection(&this.view, this.hover, hoverColor, false)
 		this.layers.drawSelection(&this.view, this.selection, selectionColor, true, this.hoverVertex)
+	}
+
+	if this.crs.epsg != 0 {
+		this.drawScaleBar()
 	}
 
 	if this.connecting {
