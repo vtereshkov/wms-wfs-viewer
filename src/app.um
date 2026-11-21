@@ -27,6 +27,7 @@ const (
 	infoWidth = 360
 	statusHeight = 26
 	rowHeight = 26
+	scrollBarWidth = 12
 	padding = 4
 	fontSize = 16
 	clickDistance = 4           // Pixels the mouse may move between pressing and releasing for a click
@@ -387,7 +388,7 @@ fn (this: ^App) layoutLayerList(gui: ^ui::Gui, height: th::fu) {
 	const step = rowHeight + 2
 	layers := this.layers.layers
 
-	gui.scrollArea(&this.layerScroll, len(layers) * step, {rect: {0, 0, 0, height}, scrollBarSize: 8, speed: 2})
+	gui.scrollArea(&this.layerScroll, len(layers) * step, {rect: {0, 0, 0, height}, scrollBarSize: scrollBarWidth, speed: 2})
 	area := gui.getContainer().getDims()
 	if !gui.isEval {
 		canvas::beginScissorRect(area)
@@ -441,6 +442,7 @@ fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
 		}
 	}
 
+	gui.label("Map", {centerY: true})
 	if captionButton(gui, "Fit to extent", this.crs.epsg != 0) {
 		this.view.fit(this.extent)
 	}
@@ -499,29 +501,24 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 	gui.label(sprintf(" %s: %s", watchedName, this.formatCoords(watched)), {centerY: true})
 	gui.label(sprintf(" WGS 84: %s", this.formatWgs84(watched)), {centerY: true})
 
-	// Attributes, under their header
-	const step = rowHeight + 2
-	numRows := len(f.attrs) + 1
+	// Attributes, scrolled under their header
+	gui.label(" Attributes:", {centerY: true})
 
-	gui.scrollArea(&this.infoScroll, numRows * step, {rect: {0, 0, 0, height - padding - gui.getDims().y}, scrollBarSize: 8, speed: 2})
+	const step = rowHeight + 2
+	gui.scrollArea(&this.infoScroll, len(f.attrs) * step, {rect: {0, 0, 0, height - padding - gui.getDims().y}, scrollBarSize: scrollBarWidth, speed: 2})
 	area := gui.getContainer().getDims()
 	if !gui.isEval {
 		canvas::beginScissorRect(area)
 	}
 
 	gui.box({dimension: rowHeight, growType: .dimension, dir: .down, padding: step - rowHeight})
-	for row := 0; row < numRows; row++ {
-		if top := row * step - this.infoScroll; top + step < 0 || top > area.h {
+	for i, attr in f.attrs {
+		if top := i * step - this.infoScroll; top + step < 0 || top > area.h {
 			gui.pushRect({})
 			continue
 		}
 
-		if row == 0 {
-			gui.label(" Attributes:", {centerY: true})
-		} else {
-			attr := f.attrs[row - 1]
-			gui.label(this.fit(sprintf("       %s: %s", attr.name, attr.value), width - 12), {centerY: true})
-		}
+		gui.label(this.fit(sprintf("       %s: %s", attr.name, attr.value), area.w - scrollBarWidth - padding), {centerY: true})
 	}
 	gui.popContainer()
 
