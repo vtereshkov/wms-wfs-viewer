@@ -278,6 +278,15 @@ fn (this: ^Wfs) featureUrl*(typeName: str, crs: geo::Crs, box: geo::Box, count: 
 		this.version, v2 ? "TYPENAMES" : "TYPENAME", encode(typeName), v2 ? "COUNT" : "MAXFEATURES", count, srs, bboxParam(box, v11 && crs.latFirst()), srs))
 }
 
+// Returns the link to the next page of a WFS 2.0 GetFeature response requested from `requestUrl`,
+// or an empty string if there is none
+fn nextPageUrl*(doc: ^xml::Node, requestUrl: str): str {
+	if root := doc.child("FeatureCollection"); root != null {
+		return upgradeScheme(root.attr("next"), requestUrl)
+	}
+	return ""
+}
+
 // Returns the message of an OGC exception report, or an empty string if `doc` is not an exception report
 fn exceptionText*(doc: ^xml::Node): str {
 	if e := doc.find("ExceptionText"); e != null {

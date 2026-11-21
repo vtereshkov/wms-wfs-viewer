@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+    The servers to choose from. Each one has a WMS for the base map, a WFS for the feature layers or both.
+    A URL may be a service endpoint or a GetCapabilities request. Write & in URLs as &amp;
+-->
+
+<servers>
+    <!-- Cadastral survey -->
+    <server name="Switzerland"
+        wms="https://geodienste.ch/db/avc_0/deu"
+        wfs="https://geodienste.ch/db/avc_0/deu"/>
+
+    <!-- basemap.de, simplified ALKIS cadastre -->
+    <server name="Lower Saxony"
+        wms="https://sgx.geodatenzentrum.de/wms_basemapde"
+        wfs="https://opendata.lgln.niedersachsen.de/doorman/noauth/alkis_wfs_einfach"/>
+
+    <!-- basemap.de, simplified ALKIS cadastre -->
+    <server name="North Rhine-Westphalia"
+        wms="https://sgx.geodatenzentrum.de/wms_basemapde"
+        wfs="https://www.wfs.nrw.de/geobasis/wfs_nw_alkis_vereinfacht"/>
+
+    <!-- Topographic map, cadastre -->
+    <server name="Norway"
+        wms="https://wms.geonorge.no/skwms1/wms.topo"
+        wfs="https://wfs.geonorge.no/skwms1/wfs.matrikkelen-eiendomskart-teig"/>
+
+    <!-- Aerial photos, cadastral map -->
+    <server name="Netherlands"
+        wms="https://service.pdok.nl/hwh/luchtfotorgb/wms/v1_0"
+        wfs="https://service.pdok.nl/kadaster/kadastralekaart/wfs/v5_0"/>
+</servers>

@@ -153,20 +153,6 @@ fn parse*(doc: ^xml::Node, latFirst: bool): ([]Feature, std::Err) {
 	return features, {}
 }
 
-// True if the server has more features than it returned, as WFS 2.0 tells by the number of features matched or,
-// if it is unknown, by a link to the next page. Some servers return fewer features than requested,
-// and some link a next page even when it is empty
-fn hasMore*(doc: ^xml::Node): bool {
-	root := doc.child("FeatureCollection")
-	if root == null {
-		return false
-	}
-	if matched := root.attr("numberMatched"); matched != "" && matched != "unknown" {
-		return std::atoi(matched) > std::atoi(root.attr("numberReturned"))
-	}
-	return root.attr("next") != ""
-}
-
 fn (this: ^Feature) numPoints*(): int {
 	n := 0
 	for _, part in this.parts {

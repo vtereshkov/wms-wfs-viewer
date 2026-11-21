@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	maxFeatures = 2000          // Per request
+	maxFeatures = 2000          // Per layer, requested at once, but possibly returned in several pages
+	maxPages = 10               // Per layer
 	maxSpan* = 3000.0           // Meters. Features are only loaded for smaller views
 	reloadDelay = 0.5           // Seconds the view must stay still before loading
 	margin = 0.5                // Features are loaded for the view grown by this fraction on each side
@@ -103,27 +104,36 @@ fn (this: ^FeatureJob) run(w: ^net::Worker) {
 		w.net.report(sprintf("%s: %s", layer.name, msg))
 	}
 
-	// The response is useless if the job has been cancelled or the layer has been requested again
-	doc, err := ows::fetchXml(w, this.layers.wfs.featureUrl(layer.name, this.layers.crs, this.box, maxFeatures))
-	if w.cancelled() || this.request != layer.request {
-		return
-	}
-	if err.code != 0 {
-		fail(layer, err.msg, w)
-		return
+	// Some servers return fewer features than requested and link the next page, so the pages are followed up to the limit.
+	// The responses are useless if the job has been cancelled or the layer has been requested again
+	features := []gml::Feature{}
+	url := this.layers.wfs.featureUrl(layer.name, this.layers.crs, this.box, maxFeatures)
+	for page := 0; url != "" && page < maxPages && len(features) < maxFeatures; page++ {
+		doc, err := ows::fetchXml(w, url)
+		if w.cancelled() || this.request != layer.request {
+			return
+		}
+		if err.code != 0 {
+			fail(layer, err.msg, w)
+			return
+		}
+
+		pageFeatures, err := gml::parse(&doc, this.layers.crs.latFirst() && this.layers.wfs.version >= "1.1")
+		if w.cancelled() || this.request != layer.request {
+			return
+		}
+		if err.code != 0 {
+			fail(layer, err.msg, w)
+			return
+		}
+
+		features = append(features, pageFeatures)
+		url = len(pageFeatures) > 0 ? ows::nextPageUrl(&doc, url) : ""
 	}
 
-	features, err := gml::parse(&doc, this.layers.crs.latFirst() && this.layers.wfs.version >= "1.1")
-	if w.cancelled() || this.request != layer.request {
-		return
-	}
-	if err.code != 0 {
-		fail(layer, err.msg, w)
-		return
-	}
-
+	// Any link left means more features
 	layer.features = features
-	layer.truncated = len(features) >= maxFeatures || gml::hasMore(&doc)
+	layer.truncated = len(features) >= maxFeatures || url != ""
 	layer.loading = false
 	layer.error = ""
 	this.layers.dirty = true
