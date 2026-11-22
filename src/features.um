@@ -25,6 +25,7 @@ const (
 	pickRadius = 6              // Pixels
 	lineWidth = 2.0
 	pointSize = 6.0
+	markerSize = 6.0            // Pixels
 )
 
 fn layerColor(index: int): uint32 {
@@ -182,7 +183,8 @@ fn drawFeature(view: ^view::View, f: ^gml::Feature, color: uint32, width: th::fu
 		return
 	}
 
-	// Segments entirely beyond one side of the view are skipped
+	// Chunks outside the view, and segments entirely beyond one side of it, are skipped
+	visible := view.box().grown(width * view.res)
 	x0, y0 := view.rect.x - width, view.rect.y - width
 	x1, y1 := view.rect.x + view.rect.w + width, view.rect.y + view.rect.h + width
 
@@ -196,18 +198,33 @@ fn drawFeature(view: ^view::View, f: ^gml::Feature, color: uint32, width: th::fu
 			continue
 		}
 
-		// Steps shorter than a pixel are merged into the next segment, except at the end of the part
-		last := len(part.points) - 1
-		prev := view.toScreen(part.points[0])
-		for i := 1; i <= last; i++ {
-			cur := view.toScreen(part.points[i])
-			if i < last && fabs(cur.x - prev.x) < 1 && fabs(cur.y - prev.y) < 1 {
+		// Steps shorter than a pixel are merged into the next segment, also across the chunks of a visible run,
+		// except at the end of the run
+		var prev: th::Vf2
+		inRun := false
+		for k, box^ in part.boxes {
+			if !box.intersects(visible) {
+				inRun = false
 				continue
 			}
-			if !(cur.x < x0 && prev.x < x0 || cur.x > x1 && prev.x > x1 || cur.y < y0 && prev.y < y0 || cur.y > y1 && prev.y > y1) {
-				canvas::drawLine(color, prev, cur, width)
+
+			first, last := part.chunk(k)
+			if !inRun {
+				prev = view.toScreen(part.points[first])
+				inRun = true
 			}
-			prev = cur
+			runEnds := k == len(part.boxes) - 1 || !part.boxes[k + 1].intersects(visible)
+
+			for i := first + 1; i <= last; i++ {
+				cur := view.toScreen(part.points[i])
+				if (i < last || !runEnds) && fabs(cur.x - prev.x) < 1 && fabs(cur.y - prev.y) < 1 {
+					continue
+				}
+				if !(cur.x < x0 && prev.x < x0 || cur.x > x1 && prev.x > x1 || cur.y < y0 && prev.y < y0 || cur.y > y1 && prev.y > y1) {
+					canvas::drawLine(color, prev, cur, width)
+				}
+				prev = cur
+			}
 		}
 	}
 }
@@ -257,6 +274,15 @@ fn (this: ^Layers) draw*(view: ^view::View) {
 	img.draw(th::mkTransform(view.toScreen({this.targetBox.min.x, this.targetBox.max.y}).round(), {scale, scale}))
 }
 
+fn onScreen(view: ^view::View, c: th::Vf2): bool {
+	return c.x >= view.rect.x && c.y >= view.rect.y && c.x <= view.rect.x + view.rect.w && c.y <= view.rect.y + view.rect.h
+}
+
+fn drawMarker(c: th::Vf2, size: th::fu, fill: uint32) {
+	canvas::drawRect(th::black, rect::mk(c.x - size / 2 - 1, c.y - size / 2 - 1, size + 2, size + 2))
+	canvas::drawRect(fill, rect::mk(c.x - size / 2, c.y - size / 2, size, size))
+}
+
 // Draws the feature highlighted and, if `markVertices` is set, its vertices, including the selected one and the one under the mouse
 fn (this: ^Layers) drawSelection*(view: ^view::View, sel: Selection, color: uint32, markVertices: bool, hoverVertex: int = -1) {
 	if sel.layer < 0 {
@@ -270,21 +296,38 @@ fn (this: ^Layers) drawSelection*(view: ^view::View, sel: Selection, color: uint
 		return
 	}
 
-	for i, p in sel.feature.vertices() {
-		c := view.toScreen(p)
-		if c.x < view.rect.x || c.y < view.rect.y || c.x > view.rect.x + view.rect.w || c.y > view.rect.y + view.rect.h {
-			continue
-		}
+	// The vertices of a chunk are only marked if they are a marker apart on average, judged by the size of the chunk
+	visible := view.box()
+	for _, part^ in sel.feature.parts {
+		for k, box^ in part.boxes {
+			first, end := part.chunk(k)
+			if !box.intersects(visible) || box.width() + box.height() < (end - first) * markerSize * view.res {
+				continue
+			}
 
-		size, fill := 6.0, th::white
-		if i == sel.vertex {
-			size, fill = 12.0, th::red
-		} else if i == hoverVertex {
-			size, fill = 10.0, color
-		}
+			// The last point of a chunk is left to the next chunk, if any
+			if k < len(part.boxes) - 1 {
+				end--
+			}
 
-		canvas::drawRect(th::black, rect::mk(c.x - size / 2 - 1, c.y - size / 2 - 1, size + 2, size + 2))
-		canvas::drawRect(fill, rect::mk(c.x - size / 2, c.y - size / 2, size, size))
+			for i := first; i <= end; i++ {
+				if c := view.toScreen(part.points[i]); onScreen(view, c) {
+					drawMarker(c, markerSize, th::white)
+				}
+			}
+		}
+	}
+
+	// The vertex under the mouse and the selected one are marked on top of the others
+	if hoverVertex >= 0 {
+		if c := view.toScreen(sel.feature.vertex(hoverVertex)); onScreen(view, c) {
+			drawMarker(c, 10, color)
+		}
+	}
+	if sel.vertex >= 0 {
+		if c := view.toScreen(sel.feature.vertex(sel.vertex)); onScreen(view, c) {
+			drawMarker(c, 12, th::red)
+		}
 	}
 }
 
@@ -296,10 +339,21 @@ fn (this: ^Selection) pickVertex*(view: ^view::View, s: th::Vf2): int {
 
 	p := view.toWorld(s)
 	nearest, nearestDist := -1, pickRadius * view.res
-	for i, v in this.feature.vertices() {
-		if d := p.dist(v); d < nearestDist {
-			nearest, nearestDist = i, d
+	offset := 0         // Index of the first vertex of the part
+	for _, part^ in this.feature.parts {
+		for k, box^ in part.boxes {
+			if !box.isNear(p, nearestDist) {
+				continue
+			}
+
+			first, last := part.chunk(k)
+			for i := first; i <= last; i++ {
+				if d := p.dist(part.points[i]); d < nearestDist {
+					nearest, nearestDist = offset + i, d
+				}
+			}
 		}
+		offset += len(part.points)
 	}
 	return nearest
 }
@@ -319,11 +373,11 @@ fn (this: ^Layers) pick*(view: ^view::View, s: th::Vf2): Selection {
 		}
 
 		for _, f^ in layer.features {
-			if !f.box.grown(tolerance).contains(p) {
+			if !f.box.isNear(p, tolerance) {
 				continue
 			}
 
-			if d := f.dist(p); d < nearestDist {
+			if d := f.dist(p, nearestDist); d < nearestDist {
 				nearest, nearestDist = Selection{i, f^, -1}, d
 			} else if area := f.box.width() * f.box.height(); area < smallestArea && f.covers(p) {
 				smallest, smallestArea = Selection{i, f^, -1}, area

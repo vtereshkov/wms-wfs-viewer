@@ -465,7 +465,7 @@ fn (this: ^App) layoutPanel(gui: ^ui::Gui) {
 fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 	sel := &this.selection
 	f := &sel.feature
-	vertices := f.vertices()
+	numVertices := f.numPoints()
 	layer := &this.layers.layers[sel.layer]
 	height := window::wp.y - statusHeight
 	width := infoWidth - 2 * padding
@@ -488,15 +488,15 @@ fn (this: ^App) layoutInfo(gui: ^ui::Gui) {
 	if kind == "Point" || kind == "Multipoint" {
 		gui.label(" " + kind, {centerY: true})
 	} else {
-		gui.label(sprintf(" %s  ·  %d vertices", kind, len(vertices)), {centerY: true})
+		gui.label(sprintf(" %s  ·  %d vertices", kind, numVertices), {centerY: true})
 	}
 
 	// The watched point: the vertex selected on the map, or the point itself, or the center
 	watched, watchedName := f.box.center(), "Center"
 	if sel.vertex >= 0 {
-		watched, watchedName = vertices[sel.vertex], sprintf("Vertex %d of %d", sel.vertex + 1, len(vertices))
-	} else if len(vertices) == 1 {
-		watched, watchedName = vertices[0], "Point"
+		watched, watchedName = f.vertex(sel.vertex), sprintf("Vertex %d of %d", sel.vertex + 1, numVertices)
+	} else if numVertices == 1 {
+		watched, watchedName = f.vertex(0), "Point"
 	}
 
 	gui.label(sprintf(" %s: %s", watchedName, this.formatCoords(watched)), {centerY: true})

@@ -13,9 +13,14 @@ type Kind* = enum {
 	ring
 }
 
+// The points of a part are split into chunks with bounding boxes, so that searching and drawing can skip whole chunks.
+// Neighboring chunks share a point, so that each segment lies in one chunk
+const chunkSize* = 32
+
 type Part* = struct {
 	kind: Kind
 	points: []geo::Point
+	boxes: []geo::Box       // One per chunk
 }
 
 type Attr* = struct {
@@ -68,6 +73,27 @@ fn parseCoords(text: str, dim: int, latFirst: bool): []geo::Point {
 	return points
 }
 
+// Returns the indices of the first and the last point of chunk `k`
+fn (this: ^Part) chunk*(k: int): (int, int) {
+	first := k * chunkSize
+	if last := first + chunkSize; last < len(this.points) {
+		return first, last
+	}
+	return first, len(this.points) - 1
+}
+
+fn (this: ^Part) makeBoxes() {
+	numChunks := len(this.points) > 1 ? (len(this.points) - 2) / chunkSize + 1 : 1
+	this.boxes = make([]geo::Box, numChunks)
+	for k, box^ in this.boxes {
+		box^ = geo::emptyBox()
+		first, last := this.chunk(k)
+		for i := first; i <= last; i++ {
+			box.add(this.points[i])
+		}
+	}
+}
+
 fn (this: ^Feature) readCoords(node: ^xml::Node, kind: Kind, dim: int, latFirst: bool) {
 	part := Part{kind: kind}
 	for _, c^ in node.children {
@@ -80,9 +106,11 @@ fn (this: ^Feature) readCoords(node: ^xml::Node, kind: Kind, dim: int, latFirst:
 	}
 
 	if len(part.points) > 0 {
+		part.makeBoxes()
 		this.parts = append(this.parts, part)
-		for _, p in part.points {
-			this.box.add(p)
+		for _, box^ in part.boxes {
+			this.box.add(box.min)
+			this.box.add(box.max)
 		}
 	}
 }
@@ -155,19 +183,21 @@ fn parse*(doc: ^xml::Node, latFirst: bool): ([]Feature, std::Err) {
 
 fn (this: ^Feature) numPoints*(): int {
 	n := 0
-	for _, part in this.parts {
+	for _, part^ in this.parts {
 		n += len(part.points)
 	}
 	return n
 }
 
-// All the points of all the parts
-fn (this: ^Feature) vertices*(): []geo::Point {
-	res := []geo::Point{}
-	for _, part in this.parts {
-		res = append(res, part.points)
+// Point `i` of all the parts taken in order
+fn (this: ^Feature) vertex*(i: int): geo::Point {
+	for _, part^ in this.parts {
+		if i < len(part.points) {
+			return part.points[i]
+		}
+		i -= len(part.points)
 	}
-	return res
+	return {}
 }
 
 fn (this: ^Feature) kindName*(): str {
@@ -191,44 +221,66 @@ fn (this: ^Feature) kindName*(): str {
 	return "Polygon"
 }
 
-// Distance from `p` to the nearest point, segment or ring edge of the feature
-fn (this: ^Feature) dist*(p: geo::Point): real {
-	best := geo::huge
-	for _, part in this.parts {
+// Distance from `p` to the nearest point, segment or ring edge of the feature, or `limit` if there is nothing nearer
+fn (this: ^Feature) dist*(p: geo::Point, limit: real = geo::huge): real {
+	best := limit
+	for _, part^ in this.parts {
 		pts := part.points
-		if part.kind == .point || len(pts) == 1 {
-			for _, pt in pts {
-				if d := p.dist(pt); d < best {
+		for k, box^ in part.boxes {
+			if !box.isNear(p, best) {
+				continue
+			}
+
+			first, last := part.chunk(k)
+			if part.kind == .point || first == last {
+				for i := first; i <= last; i++ {
+					if d := p.dist(pts[i]); d < best {
+						best = d
+					}
+				}
+				continue
+			}
+
+			for i := first + 1; i <= last; i++ {
+				if d := p.distToSegment(pts[i - 1], pts[i]); d < best {
 					best = d
 				}
-			}
-			continue
-		}
-
-		for i := 1; i < len(pts); i++ {
-			if d := p.distToSegment(pts[i - 1], pts[i]); d < best {
-				best = d
 			}
 		}
 	}
 	return best
 }
 
+// True if the edge from `a` to `b` crosses the horizontal ray from `p` to the right
+fn crossesRay(p, a, b: geo::Point): bool {
+	return (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x
+}
+
 // True if `p` is inside the rings of the feature. Holes are handled by the even-odd rule
 fn (this: ^Feature) covers*(p: geo::Point): bool {
 	inside := false
-	for _, part in this.parts {
+	for _, part^ in this.parts {
 		if part.kind != .ring {
 			continue
 		}
 
 		pts := part.points
-		for i, j := 0, len(pts) - 1; i < len(pts); i++ {
-			a, b := pts[i], pts[j]
-			if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
-				inside = !inside
+		if crossesRay(p, pts[0], pts[len(pts) - 1]) {
+			inside = !inside
+		}
+
+		// Only the chunks with points both above `p` and not above it can have edges that cross the ray
+		for k, box^ in part.boxes {
+			if box.min.y > p.y || box.max.y <= p.y {
+				continue
 			}
-			j = i
+
+			first, last := part.chunk(k)
+			for i := first + 1; i <= last; i++ {
+				if crossesRay(p, pts[i], pts[i - 1]) {
+					inside = !inside
+				}
+			}
 		}
 	}
 	return inside

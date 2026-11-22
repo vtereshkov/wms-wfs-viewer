@@ -75,6 +75,11 @@ fn (this: ^Box) grown*(d: real): Box {
 	return {{this.min.x - d, this.min.y - d}, {this.max.x + d, this.max.y + d}}
 }
 
+// True if the box grown by `d` on every side contains `p`
+fn (this: ^Box) isNear*(p: Point, d: real): bool {
+	return p.x >= this.min.x - d && p.x <= this.max.x + d && p.y >= this.min.y - d && p.y <= this.max.y + d
+}
+
 // Returns the box scaled by `factor` around its center
 fn (this: ^Box) scaled*(factor: real): Box {
 	c := this.center()
