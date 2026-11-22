@@ -191,7 +191,7 @@ fn epsgCode*(s: str): int {
 	if i == len(s) {
 		return 0
 	}
-	return std::atoi(slice(s, i))
+	return std::atoi(s, i)
 }
 
 fn (this: ^Crs) name*(): str {

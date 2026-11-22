@@ -32,9 +32,10 @@ fn charSet*(chars: str): CharSet {
 	return set
 }
 
-fn parseHex(s: str): int {
+fn parseHex(s: str, pos: int): int {
 	x := 0
-	for _, c in s {
+	for i := pos; i < len(s); i++ {
+		c := s[i]
 		if c >= '0' && c <= '9' {
 			x = 16 * x + int(c) - int('0')
 		} else if c >= 'a' && c <= 'f' {
@@ -66,43 +67,28 @@ fn decodeEntity(entity: str): str {
 	if entity == "quot" {return "\""}
 	if entity == "apos" {return "'"}
 	if len(entity) > 1 && entity[0] == '#' {
-		return encodeUtf8(entity[1] == 'x' ? parseHex(slice(entity, 2)) : std::atoi(slice(entity, 1)))
+		return encodeUtf8(entity[1] == 'x' ? parseHex(entity, 2) : std::atoi(entity, 1))
 	}
 	return "&" + entity + ";"
 }
 
 fn unescape(s: str): str {
-	amp := -1
-	for i, c in s {
-		if c == '&' {
-			amp = i
-			break
-		}
-	}
+	amp := std::find(s, "&")
 	if amp < 0 {
 		return s
 	}
 
-	res := slice(s, 0, amp)
-	for i := amp; i < len(s); i++ {
-		if s[i] != '&' {
-			res += str(s[i])
-			continue
-		}
-
-		semi := i + 1
-		for semi < len(s) && s[semi] != ';' {
-			semi++
-		}
-		if semi >= len(s) {
-			res += slice(s, i)
+	res, start := "", 0
+	for amp >= 0 {
+		semi := std::find(s, ";", amp + 1)
+		if semi < 0 {
 			break
 		}
-
-		res += decodeEntity(slice(s, i + 1, semi))
-		i = semi
+		res += slice(s, start, amp) + decodeEntity(slice(s, amp + 1, semi))
+		start = semi + 1
+		amp = std::find(s, "&", start)
 	}
-	return res
+	return res + slice(s, start)
 }
 
 fn splitName(qname: str): (str, str) {
@@ -114,27 +100,11 @@ fn splitName(qname: str): (str, str) {
 	return "", qname
 }
 
-// True if `s` contains `word` at index `i`
-fn hasAt(s: str, i: int, word: str): bool {
-	if i + len(word) > len(s) {
-		return false
-	}
-	for k, c in word {
-		if s[i + k] != c {
-			return false
-		}
-	}
-	return true
-}
-
 fn skipPast(s: str, i: int, terminator: str): int {
-	for i < len(s) {
-		if s[i] == terminator[0] && hasAt(s, i, terminator) {
-			return i + len(terminator)
-		}
-		i++
+	if end := std::find(s, terminator, i); end >= 0 {
+		return end + len(terminator)
 	}
-	return i
+	return len(s)
 }
 
 // Returns s[from:to] without the leading and trailing whitespace
@@ -188,9 +158,9 @@ fn parse*(s: str): (Node, std::Err) {
 		if next == '?' {
 			i = skipPast(s, i, "?>")
 		} else if next == '!' {
-			if hasAt(s, i, "<!--") {
+			if std::startswith(s, "<!--", i) {
 				i = skipPast(s, i, "-->")
-			} else if hasAt(s, i, "<![CDATA[") {
+			} else if std::startswith(s, "<![CDATA[", i) {
 				i = skipPast(s, i, "]]>")
 			} else {
 				i = skipPast(s, i, ">")
@@ -354,15 +324,13 @@ fn (this: ^Node) find*(name: str): ^Node {
 // Follows a path of local names, e.g. "Capability/Request/GetMap", and returns the element found or null
 fn (this: ^Node) path*(path: str): ^Node {
 	node := this
-	start := 0
-	for i := 0; i <= len(path); i++ {
-		if i == len(path) || path[i] == '/' {
-			node = node.child(slice(path, start, i))
-			if node == null {
-				return null
-			}
-			start = i + 1
+	for start := 0; node != null {
+		end := std::find(path, "/", start)
+		if end < 0 {
+			return node.child(slice(path, start))
 		}
+		node = node.child(slice(path, start, end))
+		start = end + 1
 	}
-	return node
+	return null
 }

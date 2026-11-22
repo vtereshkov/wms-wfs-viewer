@@ -155,7 +155,7 @@ fn (this: ^TileJob) run(w: ^net::Worker) {
 		return
 	}
 
-	if contentType := net::header(resp, "content-type"); len(contentType) < 6 || slice(contentType, 0, 6) != "image/" {
+	if contentType := net::header(resp, "content-type"); !std::startswith(contentType, "image/") {
 		msg := "Not an image"
 		if doc, parseErr := xml::parse(resp.body); parseErr.code == 0 {
 			msg = ows::exceptionText(&doc)

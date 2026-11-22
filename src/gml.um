@@ -56,7 +56,7 @@ fn parseCoords(text: str, dim: int, latFirst: bool): []geo::Point {
 			i++
 		}
 		if i > start {
-			values = append(values, std::atof(slice(text, start, i)))
+			values = append(values, std::atof(text, start))
 		}
 	}
 
